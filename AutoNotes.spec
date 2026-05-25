@@ -115,7 +115,7 @@ exe = EXE(
     target_arch=None,   # inherit host arch (arm64)
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    icon='AppIcon.icns',
 )
 
 coll = COLLECT(
@@ -132,7 +132,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='AutoNotes.app',
-    icon=None,
+    icon='AppIcon.icns',
     bundle_identifier='com.autonotes.app',
     version='1.0.0',
     info_plist={
