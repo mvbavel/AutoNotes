@@ -59,7 +59,7 @@ def _get_duration(video_path: str) -> float:
 def _extract_frame(video_path: str, timestamp: float, output_path: str):
     cmd = [
         FFMPEG, "-y", "-ss", str(timestamp), "-i", video_path,
-        "-vframes", "1", "-q:v", "3", "-vf", "scale=1280:-1",
+        "-vframes", "1", "-q:v", "3", "-vf", "scale=640:-1",
         output_path
     ]
     subprocess.run(cmd, capture_output=True)
