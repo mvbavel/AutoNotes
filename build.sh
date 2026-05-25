@@ -32,9 +32,13 @@ if [[ -d "$APP" ]]; then
     echo ""
     echo "✓ Build complete: $APP"
     echo "  Size: $(du -sh "$APP" | cut -f1)"
+
+    bash "$SCRIPT_DIR/make_dmg.sh"
+
     echo ""
-    echo "  To open:  open \"$APP\""
-    echo "  To copy to Applications:  cp -r \"$APP\" /Applications/"
+    echo "  To open:       open \"$APP\""
+    echo "  To distribute: share dist/AutoNotes.dmg"
+    echo "  To install:    cp -r \"$APP\" /Applications/"
 else
     echo "Build failed — no .app produced."
     exit 1

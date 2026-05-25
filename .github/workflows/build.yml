@@ -1,0 +1,71 @@
+name: Build AutoNotes
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14   # Apple Silicon (arm64) — matches the target platform
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install Homebrew dependencies
+        run: brew install ffmpeg yt-dlp
+
+      # Cache the pip download cache and installed packages to speed up re-runs
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/pip
+            ~/Library/Python/3.9/lib/python/site-packages
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+
+      - name: Install Python dependencies
+        run: |
+          pip3 install --user -r requirements.txt
+          pip3 install --user pyinstaller
+
+      # PyInstaller caches bytecode in __pycache__; the Analysis cache lives in build/
+      - name: Cache PyInstaller build
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: pyinstaller-${{ runner.os }}-${{ hashFiles('AutoNotes.spec', 'requirements.txt') }}
+          restore-keys: pyinstaller-${{ runner.os }}-
+
+      - name: Build AutoNotes.app
+        run: |
+          PYINSTALLER="$HOME/Library/Python/3.9/bin/pyinstaller"
+          "$PYINSTALLER" --noconfirm --log-level WARN AutoNotes.spec
+
+      - name: Ad-hoc sign .app
+        run: codesign --force --deep --sign - dist/AutoNotes.app || true
+
+      - name: Create DMG
+        run: bash make_dmg.sh
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoNotes-dmg
+          path: dist/AutoNotes.dmg
+          retention-days: 14
+
+      # Only publish a GitHub Release when a version tag is pushed (e.g. v1.2.0)
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/AutoNotes.dmg
+          generate_release_notes: true
