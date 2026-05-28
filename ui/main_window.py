@@ -247,7 +247,7 @@ class MainWindow(QMainWindow):
             self._local_file = path
             self.url_edit.clear()
             self.file_path_label.setText(os.path.basename(path))
-            self.file_path_label.setStyleSheet("color: #333; font-size: 11px;")
+            self.file_path_label.setStyleSheet("color: #ffffff; font-size: 11px;")
             self.process_btn.setEnabled(bool(self.api_key_edit.text().strip()))
 
     def _browse_output_dir(self):
@@ -285,12 +285,14 @@ class MainWindow(QMainWindow):
         self.open_btn.setVisible(False)
 
         self._worker.start()
+        self.file_path_label.setStyleSheet("color: #1a73e8; font-size: 11px;")
 
     def _cancel_processing(self):
         if self._worker:
             self._worker.cancel()
             self._worker.terminate()
         self._on_log("Cancelled by user.")
+        self.file_path_label.setStyleSheet("color: #ffffff; font-size: 11px;")
         self._set_idle()
 
     def _on_stage_changed(self, label: str, current: int, total: int):
@@ -324,6 +326,7 @@ class MainWindow(QMainWindow):
             lbl.setStyleSheet("color: #34a853; font-size: 12px;")
         self.progress_bar.setValue(100)
 
+        self.file_path_label.setStyleSheet("color: #34a853; font-size: 11px;")
         self.open_btn.setVisible(True)
         self.open_btn.clicked.connect(lambda: self._open_file(out_path))
         self._set_idle()

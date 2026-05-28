@@ -13,9 +13,8 @@ _UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 _BASE_ARGS = [
-    "--cookies-from-browser", "chrome",
     "--user-agent", _UA,
-    "--extractor-args", "youtube:player_client=tv_embedded,web",
+    "--extractor-args", "youtube:player_client=ios,android,web",
     "--no-playlist",
     "--retries", "5",
     "--fragment-retries", "5",
