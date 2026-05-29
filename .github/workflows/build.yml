@@ -25,16 +25,14 @@ jobs:
       - name: Cache pip
         uses: actions/cache@v4
         with:
-          path: |
-            ~/Library/Caches/pip
-            ~/Library/Python/3.9/lib/python/site-packages
+          path: ~/Library/Caches/pip
           key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
           restore-keys: pip-${{ runner.os }}-
 
       - name: Install Python dependencies
         run: |
-          pip3 install --user -r requirements.txt
-          pip3 install --user pyinstaller
+          pip3 install -r requirements.txt
+          pip3 install pyinstaller
 
       # PyInstaller caches bytecode in __pycache__; the Analysis cache lives in build/
       - name: Cache PyInstaller build
@@ -45,9 +43,7 @@ jobs:
           restore-keys: pyinstaller-${{ runner.os }}-
 
       - name: Build AutoNotes.app
-        run: |
-          PYINSTALLER="$HOME/Library/Python/3.9/bin/pyinstaller"
-          "$PYINSTALLER" --noconfirm --log-level WARN AutoNotes.spec
+        run: python3 -m PyInstaller --noconfirm --log-level WARN AutoNotes.spec
 
       - name: Ad-hoc sign .app
         run: codesign --force --deep --sign - dist/AutoNotes.app || true
