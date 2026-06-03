@@ -21,6 +21,8 @@ def generate_notes(
     video_title: str,
     api_key: str,
     progress_cb=None,
+    description: str = "",
+    yt_chapters: list[dict] | None = None,
 ) -> dict:
     import anthropic
 
@@ -35,9 +37,15 @@ def generate_notes(
     estimated_tokens = len(transcript_text) // _CHARS_PER_TOKEN + len(top_frames) * _TOKENS_PER_IMAGE
 
     if estimated_tokens > _TOKEN_THRESHOLD:
-        notes = _generate_chunked(client, segments, top_frames, video_title, progress_cb)
+        notes = _generate_chunked(
+            client, segments, top_frames, video_title, progress_cb,
+            description=description, yt_chapters=yt_chapters,
+        )
     else:
-        content = _build_content(transcript_text, video_title, top_frames, progress_cb)
+        content = _build_content(
+            transcript_text, video_title, top_frames, progress_cb,
+            description=description, yt_chapters=yt_chapters,
+        )
         if progress_cb:
             progress_cb(60)
         response = _call_with_retry(client, content)
@@ -51,7 +59,10 @@ def generate_notes(
     return notes
 
 
-def _generate_chunked(client, segments, frames, video_title, progress_cb=None):
+def _generate_chunked(
+    client, segments, frames, video_title, progress_cb=None,
+    description="", yt_chapters=None,
+):
     """Split transcript and frames into two halves, call Claude once per half, merge."""
     if not segments:
         return _fallback_notes(video_title, segments)
@@ -77,7 +88,12 @@ def _generate_chunked(client, segments, frames, video_title, progress_cb=None):
             continue
 
         text = _build_transcript(chunk_segs)
-        content = _build_content(text, video_title, chunk_frames)
+        # Only include description/chapters in the first chunk to avoid redundancy
+        content = _build_content(
+            text, video_title, chunk_frames,
+            description=description if i == 0 else "",
+            yt_chapters=yt_chapters if i == 0 else None,
+        )
 
         if i > 0:
             # Wait between chunks so we don't slam the TPM window
@@ -164,18 +180,33 @@ def _format_ts(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
-def _build_content(transcript: str, title: str, frames: list[dict], progress_cb=None) -> list:
-    content = [
-        {
-            "type": "text",
-            "text": (
-                f"Video title: {title}\n\n"
-                "TRANSCRIPT (timestamps and speakers):\n"
-                f"{transcript}\n\n"
-                "CANDIDATE SCREENSHOTS (evaluate each for usefulness):\n"
-            ),
-        }
-    ]
+def _build_content(
+    transcript: str,
+    title: str,
+    frames: list[dict],
+    progress_cb=None,
+    description: str = "",
+    yt_chapters: list[dict] | None = None,
+) -> list:
+    header = f"Video title: {title}\n"
+
+    if description:
+        # Trim to avoid ballooning the prompt for very long descriptions
+        trimmed = description[:800].rstrip()
+        if len(description) > 800:
+            trimmed += "…"
+        header += f"\nVIDEO DESCRIPTION:\n{trimmed}\n"
+
+    if yt_chapters:
+        chapter_lines = "\n".join(
+            f"  {_format_ts(c['start_time'])} – {c.get('title', 'Chapter')}"
+            for c in yt_chapters
+        )
+        header += f"\nYOUTUBE CHAPTERS (use these as natural section breaks):\n{chapter_lines}\n"
+
+    header += "\nTRANSCRIPT (timestamps and speakers):\n" + transcript + "\n\nCANDIDATE SCREENSHOTS (evaluate each for usefulness):\n"
+
+    content = [{"type": "text", "text": header}]
 
     for i, frame in enumerate(frames):
         if progress_cb:
@@ -247,7 +278,7 @@ Based on the transcript and screenshots, produce structured notes in this exact 
 }
 
 Rules:
-- Identify 4-8 natural chapters based on topic transitions in the content
+- If YouTube chapters are provided, use them as chapter boundaries (title and timing); otherwise identify 4-8 natural chapters based on topic transitions
 - Each chapter needs 4-8 key points as concise, informative bullets
 - Wrap key concepts, jargon, names, and important terms in **double asterisks**
 - screenshot_idx: use the screenshot number (1-based integer) if that screenshot clearly

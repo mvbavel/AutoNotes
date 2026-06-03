@@ -1,3 +1,4 @@
+import glob
 import json
 import os
 import re
@@ -21,11 +22,18 @@ _BASE_ARGS = [
 ]
 
 
-def download_youtube(url: str, output_dir: str, progress_cb=None, log_cb=None) -> tuple[str, str]:
-    """Download a YouTube video and return (file_path, title)."""
-    # Fetch title/metadata without downloading
+def download_youtube(
+    url: str, output_dir: str, progress_cb=None, log_cb=None
+) -> tuple[str, str, str, list]:
+    """Download a YouTube video and return (file_path, title, description, chapters).
+
+    Also attempts to download subtitles (manual then auto-generated) as SRT files
+    alongside the video. Callers can look for *.srt files in output_dir afterward.
+    """
     info = _run_json([YTDLP] + _BASE_ARGS + ["--dump-single-json", url])
     title = info.get("title", "video")
+    description = info.get("description", "") or ""
+    chapters = info.get("chapters") or []
     safe_title = _safe_filename(title)
     out_template = os.path.join(output_dir, f"{safe_title}.%(ext)s")
     out_path = os.path.join(output_dir, f"{safe_title}.mp4")
@@ -42,6 +50,11 @@ def download_youtube(url: str, output_dir: str, progress_cb=None, log_cb=None) -
         ),
         "--merge-output-format", "mp4",
         "--ffmpeg-location", ffmpeg_dir,
+        # Fetch subtitles (manual preferred, auto-generated as fallback)
+        "--write-sub",
+        "--write-auto-sub",
+        "--sub-langs", "en.*",
+        "--convert-subs", "srt",
         "--newline",
         "--progress",
         "-o", out_template,
@@ -70,7 +83,52 @@ def download_youtube(url: str, output_dir: str, progress_cb=None, log_cb=None) -
     if proc.returncode != 0:
         raise RuntimeError(f"yt-dlp exited with code {proc.returncode}")
 
-    return out_path, title
+    return out_path, title, description, chapters
+
+
+def find_transcript(output_dir: str) -> list[dict] | None:
+    """Look for a downloaded SRT subtitle file and parse it into segments.
+
+    Returns [{start, end, text}] or None if no subtitle file was found.
+    """
+    srt_files = glob.glob(os.path.join(output_dir, "*.srt"))
+    if not srt_files:
+        return None
+    segments = _parse_srt(srt_files[0])
+    return segments if segments else None
+
+
+def _parse_srt(path: str) -> list[dict]:
+    """Parse an SRT file into [{start, end, text}] segments."""
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+
+    segments = []
+    for block in re.split(r"\n\n+", content.strip()):
+        lines = block.strip().splitlines()
+        if len(lines) < 3:
+            continue
+        ts_match = re.match(
+            r"(\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,\.]\d{3})",
+            lines[1],
+        )
+        if not ts_match:
+            continue
+        start = _srt_ts_to_secs(ts_match.group(1))
+        end = _srt_ts_to_secs(ts_match.group(2))
+        text = " ".join(lines[2:])
+        text = re.sub(r"<[^>]+>", "", text)  # strip any inline HTML tags
+        text = re.sub(r"\s+", " ", text).strip()
+        if text:
+            segments.append({"start": start, "end": end, "text": text})
+
+    return segments
+
+
+def _srt_ts_to_secs(ts: str) -> float:
+    ts = ts.replace(",", ".")
+    h, m, s = ts.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(s)
 
 
 def _run_json(cmd: list[str]) -> dict:

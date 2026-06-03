@@ -5,7 +5,7 @@ import tempfile
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from pipeline.downloader import download_youtube
+from pipeline.downloader import download_youtube, find_transcript
 from pipeline.transcriber import extract_audio, transcribe
 from pipeline.diarizer import diarize
 from pipeline.frame_extractor import extract_frames
@@ -55,13 +55,17 @@ class ProcessingWorker(QThread):
         # ── Stage 1: Download / load ──────────────────────────────────────
         self._stage(1, total)
         is_url = self.input_source.startswith(("http://", "https://"))
+        description = ""
+        yt_chapters = []
         if is_url:
             self._log("Downloading from YouTube…")
-            video_path, title = download_youtube(
+            video_path, title, description, yt_chapters = download_youtube(
                 self.input_source, temp_dir,
                 progress_cb=self._progress,
                 log_cb=self._log,
             )
+            if yt_chapters:
+                self._log(f"Found {len(yt_chapters)} YouTube chapters")
         else:
             video_path = self.input_source
             title = os.path.splitext(os.path.basename(video_path))[0]
@@ -70,26 +74,47 @@ class ProcessingWorker(QThread):
         self._log(f"Video: {title}")
         safe_title = _safe_filename(title)
 
-        # ── Stage 2: Audio extraction ─────────────────────────────────────
+        # ── Stage 2: Audio extraction (skip if YouTube transcript found) ──
         self._stage(2, total)
-        self._log("Extracting audio track…")
-        audio_path = extract_audio(video_path, temp_dir, progress_cb=self._progress)
+        yt_segments = None
+        if is_url:
+            yt_segments = find_transcript(temp_dir)
+            if yt_segments:
+                self._log(f"YouTube transcript found: {len(yt_segments)} segments — skipping audio extraction")
+                self._progress(100)
+                audio_path = None
+            else:
+                self._log("No YouTube transcript available — extracting audio…")
+                audio_path = extract_audio(video_path, temp_dir, progress_cb=self._progress)
+        else:
+            self._log("Extracting audio track…")
+            audio_path = extract_audio(video_path, temp_dir, progress_cb=self._progress)
 
         # ── Stage 3: Transcription ────────────────────────────────────────
         self._stage(3, total)
-        model = self.config.get("whisper_model", "medium")
-        self._log(f"Transcribing with Whisper ({model})… (this may take a while)")
-        segments = transcribe(audio_path, model_size=model, progress_cb=self._progress)
-        self._log(f"Transcription: {len(segments)} segments")
+        if yt_segments is not None:
+            segments = yt_segments
+            self._log(f"Using YouTube transcript ({len(segments)} segments) — skipping Whisper")
+            self._progress(100)
+        else:
+            model = self.config.get("whisper_model", "medium")
+            self._log(f"Transcribing with Whisper ({model})… (this may take a while)")
+            segments = transcribe(audio_path, model_size=model, progress_cb=self._progress)
+            self._log(f"Transcription: {len(segments)} segments")
 
         # ── Stage 4: Speaker diarization ──────────────────────────────────
         self._stage(4, total)
         hf_token = self.config.get("hf_token", "").strip() or None
-        if hf_token:
+        if yt_segments is not None:
+            # No audio available for diarization when using YouTube transcript
+            self._log("Skipping speaker diarization (YouTube transcript used)")
+            self._progress(100)
+        elif hf_token:
             self._log("Identifying speakers with pyannote…")
+            segments = diarize(audio_path, segments, hf_token, progress_cb=self._progress)
         else:
             self._log("No HuggingFace token — skipping speaker diarization")
-        segments = diarize(audio_path, segments, hf_token, progress_cb=self._progress)
+            segments = diarize(audio_path, segments, None, progress_cb=self._progress)
 
         # ── Stage 5: Frame extraction ─────────────────────────────────────
         self._stage(5, total)
@@ -104,6 +129,8 @@ class ProcessingWorker(QThread):
             segments, frames, title,
             api_key=self.config["anthropic_key"],
             progress_cb=self._progress,
+            description=description,
+            yt_chapters=yt_chapters,
         )
         chapters = notes.get("chapters", [])
         self._log(f"Generated {len(chapters)} chapters")
