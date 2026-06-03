@@ -72,9 +72,10 @@ def _generate_chunked(
     chunk1_segs = [s for s in segments if s["start"] < midpoint]
     chunk2_segs = [s for s in segments if s["start"] >= midpoint]
 
-    # Assign frames to whichever half their timestamp falls in
-    chunk1_frames = [f for f in frames if f["timestamp"] < midpoint][:5]
-    chunk2_frames = [f for f in frames if f["timestamp"] >= midpoint][:5]
+    # Distribute frames evenly between chunks (up to half of MAX_SCREENSHOTS each)
+    per_chunk = MAX_SCREENSHOTS // 2
+    chunk1_frames = [f for f in frames if f["timestamp"] < midpoint][:per_chunk]
+    chunk2_frames = [f for f in frames if f["timestamp"] >= midpoint][:per_chunk]
     chunk2_frame_offset = len(chunk1_frames)  # for remapping screenshot_idx
 
     all_chapters = []
