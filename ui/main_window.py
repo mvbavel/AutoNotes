@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
 )
 
 from pipeline.worker import ProcessingWorker
+from version import __version__
 
 
 class MainWindow(QMainWindow):
@@ -38,7 +39,7 @@ class MainWindow(QMainWindow):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(title)
 
-        subtitle = QLabel("AI-powered video notes with screenshots")
+        subtitle = QLabel(f"AI-powered video notes with screenshots  ·  v{__version__}")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setStyleSheet("color: #666; font-size: 12px;")
         root.addWidget(subtitle)

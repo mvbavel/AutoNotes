@@ -5,6 +5,7 @@
 block_cipher = None
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules, collect_data_files
+from version import __version__ as _version
 
 # ── Collect namespace packages (pyannote.*) ───────────────────────────────────
 _pyannote_pkgs = [
@@ -134,12 +135,12 @@ app = BUNDLE(
     name='AutoNotes.app',
     icon='AppIcon.icns',
     bundle_identifier='com.autonotes.app',
-    version='1.2.0',
+    version=_version,
     info_plist={
         'CFBundleName': 'AutoNotes',
         'CFBundleDisplayName': 'AutoNotes',
-        'CFBundleShortVersionString': '1.2.0',
-        'CFBundleVersion': '3',
+        'CFBundleShortVersionString': _version,
+        'CFBundleVersion': _version,
         'LSMinimumSystemVersion': '12.0',
         'NSHighResolutionCapable': True,
         'NSPrincipalClass': 'NSApplication',
