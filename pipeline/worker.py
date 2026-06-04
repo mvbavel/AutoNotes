@@ -6,6 +6,7 @@ import tempfile
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from pipeline.downloader import download_youtube, find_transcript
+from pipeline.teams_downloader import is_teams_url, download_teams_recording
 from pipeline.transcriber import extract_audio, transcribe
 from pipeline.diarizer import diarize
 from pipeline.frame_extractor import extract_frames
@@ -57,7 +58,47 @@ class ProcessingWorker(QThread):
         is_url = self.input_source.startswith(("http://", "https://"))
         description = ""
         yt_chapters = []
-        if is_url:
+        attendees: list[str] = []
+        ai_notes: str | None = None
+        pre_segments = None   # transcript segments from download (VTT/SRT/Graph)
+
+        if is_url and is_teams_url(self.input_source):
+            self._log("Detected Teams/SharePoint URL — downloading recording…")
+            teams = download_teams_recording(
+                self.input_source, temp_dir,
+                progress_cb=self._progress,
+                log_cb=self._log,
+            )
+            video_path = teams["video_path"]
+            title = teams["title"]
+            description = teams["description"]
+            pre_segments = teams["transcript_segments"]
+
+            # Fetch Graph API metadata if client ID is configured
+            ms_client_id = self.config.get("ms_client_id", "").strip()
+            join_url = self.config.get("ms_join_url", "").strip()
+            if ms_client_id and join_url:
+                from pipeline.graph_client import fetch_meeting_context
+                ctx = fetch_meeting_context(ms_client_id, join_url, log_cb=self._log)
+                attendees = ctx["attendees"]
+                ai_notes = ctx["ai_notes"]
+                # Graph transcript takes priority over yt-dlp VTT
+                if ctx["transcript_vtt"]:
+                    from pipeline.vtt_parser import parse_vtt
+                    import tempfile as _tf, os as _os
+                    tmp_vtt = _os.path.join(temp_dir, "graph_transcript.vtt")
+                    with open(tmp_vtt, "w", encoding="utf-8") as f:
+                        f.write(ctx["transcript_vtt"])
+                    parsed = parse_vtt(tmp_vtt)
+                    if parsed:
+                        pre_segments = parsed
+                        self._log(f"Using Graph API transcript ({len(pre_segments)} segments)")
+                if ctx["title"]:
+                    title = ctx["title"]
+            elif ms_client_id and not join_url:
+                self._log("MS Client ID set but no Join URL provided — skipping Graph API")
+
+        elif is_url:
             self._log("Downloading from YouTube…")
             video_path, title, description, yt_chapters = download_youtube(
                 self.input_source, temp_dir,
@@ -74,17 +115,22 @@ class ProcessingWorker(QThread):
         self._log(f"Video: {title}")
         safe_title = _safe_filename(title)
 
-        # ── Stage 2: Audio extraction (skip if YouTube transcript found) ──
+        # ── Stage 2: Audio extraction (skip if transcript already available) ──
         self._stage(2, total)
-        yt_segments = None
-        if is_url:
-            yt_segments = find_transcript(temp_dir)
-            if yt_segments:
-                self._log(f"YouTube transcript found: {len(yt_segments)} segments — skipping audio extraction")
+        if pre_segments is not None:
+            self._log(f"Transcript available ({len(pre_segments)} segments) — skipping audio extraction")
+            self._progress(100)
+            audio_path = None
+        elif is_url:
+            # Check for yt-dlp downloaded SRT (YouTube)
+            srt_segs = find_transcript(temp_dir)
+            if srt_segs:
+                pre_segments = srt_segs
+                self._log(f"YouTube transcript found: {len(pre_segments)} segments — skipping audio extraction")
                 self._progress(100)
                 audio_path = None
             else:
-                self._log("No YouTube transcript available — extracting audio…")
+                self._log("No transcript available — extracting audio…")
                 audio_path = extract_audio(video_path, temp_dir, progress_cb=self._progress)
         else:
             self._log("Extracting audio track…")
@@ -92,9 +138,9 @@ class ProcessingWorker(QThread):
 
         # ── Stage 3: Transcription ────────────────────────────────────────
         self._stage(3, total)
-        if yt_segments is not None:
-            segments = yt_segments
-            self._log(f"Using YouTube transcript ({len(segments)} segments) — skipping Whisper")
+        if pre_segments is not None:
+            segments = pre_segments
+            self._log(f"Using pre-existing transcript ({len(segments)} segments) — skipping Whisper")
             self._progress(100)
         else:
             model = self.config.get("whisper_model", "medium")
@@ -105,9 +151,8 @@ class ProcessingWorker(QThread):
         # ── Stage 4: Speaker diarization ──────────────────────────────────
         self._stage(4, total)
         hf_token = self.config.get("hf_token", "").strip() or None
-        if yt_segments is not None:
-            # No audio available for diarization when using YouTube transcript
-            self._log("Skipping speaker diarization (YouTube transcript used)")
+        if pre_segments is not None:
+            self._log("Skipping speaker diarization (transcript already has speaker labels)")
             self._progress(100)
         elif hf_token:
             self._log("Identifying speakers with pyannote…")
@@ -130,7 +175,9 @@ class ProcessingWorker(QThread):
             api_key=self.config["anthropic_key"],
             progress_cb=self._progress,
             description=description,
-            yt_chapters=yt_chapters,
+            yt_chapters=yt_chapters or None,
+            attendees=attendees or None,
+            ai_notes=ai_notes,
         )
         chapters = notes.get("chapters", [])
         self._log(f"Generated {len(chapters)} chapters")

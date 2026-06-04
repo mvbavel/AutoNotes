@@ -70,7 +70,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(box)
 
         self.url_edit = QLineEdit()
-        self.url_edit.setPlaceholderText("Paste YouTube URL  —  or browse for a local file")
+        self.url_edit.setPlaceholderText("Paste YouTube URL, Teams recording URL, or SharePoint URL  —  or browse for a local file")
         self.url_edit.textChanged.connect(self._on_input_changed)
         layout.addWidget(self.url_edit)
 
@@ -118,6 +118,23 @@ class MainWindow(QMainWindow):
         )
         hint.setStyleSheet("color: #888; font-size: 10px;")
         form.addRow("", hint)
+
+        # ── Microsoft Teams / Graph API (optional) ────────────────────────
+        teams_header = QLabel("Microsoft Teams (optional)")
+        teams_header.setStyleSheet("color: #aaa; font-size: 10px; font-weight: bold; margin-top: 6px;")
+        form.addRow("", teams_header)
+
+        self.ms_client_id_edit = QLineEdit()
+        self.ms_client_id_edit.setPlaceholderText("Azure app Client ID (for attendees, AI notes, transcript)")
+        form.addRow("MS Client ID:", self.ms_client_id_edit)
+
+        self.ms_join_url_edit = QLineEdit()
+        self.ms_join_url_edit.setPlaceholderText("Teams meeting Join URL (from calendar invite — enables full metadata)")
+        form.addRow("Join URL:", self.ms_join_url_edit)
+
+        ms_hint = QLabel("Leave blank to use recording URL only (video + VTT transcript via yt-dlp)")
+        ms_hint.setStyleSheet("color: #888; font-size: 10px;")
+        form.addRow("", ms_hint)
 
         return box
 
@@ -271,6 +288,8 @@ class MainWindow(QMainWindow):
             "hf_token": self.hf_token_edit.text().strip(),
             "whisper_model": self.model_combo.currentText(),
             "output_dir": self.output_dir_edit.text().strip() or os.path.expanduser("~/Desktop"),
+            "ms_client_id": self.ms_client_id_edit.text().strip(),
+            "ms_join_url": self.ms_join_url_edit.text().strip(),
         }
 
         self._worker = ProcessingWorker(source, config)
@@ -360,6 +379,8 @@ class MainWindow(QMainWindow):
         s.setValue("hf_token", self.hf_token_edit.text())
         s.setValue("whisper_model", self.model_combo.currentText())
         s.setValue("output_dir", self.output_dir_edit.text())
+        s.setValue("ms_client_id", self.ms_client_id_edit.text())
+        s.setValue("ms_join_url", self.ms_join_url_edit.text())
 
     def _load_settings(self):
         s = self._settings
@@ -370,6 +391,8 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self.model_combo.setCurrentIndex(idx)
         self.output_dir_edit.setText(s.value("output_dir", ""))
+        self.ms_client_id_edit.setText(s.value("ms_client_id", ""))
+        self.ms_join_url_edit.setText(s.value("ms_join_url", ""))
 
         # Refresh button state based on loaded settings
         self._on_input_changed()

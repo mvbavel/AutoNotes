@@ -23,6 +23,8 @@ def generate_notes(
     progress_cb=None,
     description: str = "",
     yt_chapters: list[dict] | None = None,
+    attendees: list[str] | None = None,
+    ai_notes: str | None = None,
 ) -> dict:
     import anthropic
 
@@ -40,11 +42,13 @@ def generate_notes(
         notes = _generate_chunked(
             client, segments, top_frames, video_title, progress_cb,
             description=description, yt_chapters=yt_chapters,
+            attendees=attendees, ai_notes=ai_notes,
         )
     else:
         content = _build_content(
             transcript_text, video_title, top_frames, progress_cb,
             description=description, yt_chapters=yt_chapters,
+            attendees=attendees, ai_notes=ai_notes,
         )
         if progress_cb:
             progress_cb(60)
@@ -61,7 +65,7 @@ def generate_notes(
 
 def _generate_chunked(
     client, segments, frames, video_title, progress_cb=None,
-    description="", yt_chapters=None,
+    description="", yt_chapters=None, attendees=None, ai_notes=None,
 ):
     """Split transcript and frames into two halves, call Claude once per half, merge."""
     if not segments:
@@ -89,11 +93,13 @@ def _generate_chunked(
             continue
 
         text = _build_transcript(chunk_segs)
-        # Only include description/chapters in the first chunk to avoid redundancy
+        # Only include metadata in the first chunk to avoid redundancy
         content = _build_content(
             text, video_title, chunk_frames,
             description=description if i == 0 else "",
             yt_chapters=yt_chapters if i == 0 else None,
+            attendees=attendees if i == 0 else None,
+            ai_notes=ai_notes if i == 0 else None,
         )
 
         if i > 0:
@@ -188,15 +194,19 @@ def _build_content(
     progress_cb=None,
     description: str = "",
     yt_chapters: list[dict] | None = None,
+    attendees: list[str] | None = None,
+    ai_notes: str | None = None,
 ) -> list:
     header = f"Video title: {title}\n"
 
+    if attendees:
+        header += f"\nATTENDEES: {', '.join(attendees)}\n"
+
     if description:
-        # Trim to avoid ballooning the prompt for very long descriptions
         trimmed = description[:800].rstrip()
         if len(description) > 800:
             trimmed += "…"
-        header += f"\nVIDEO DESCRIPTION:\n{trimmed}\n"
+        header += f"\nDESCRIPTION:\n{trimmed}\n"
 
     if yt_chapters:
         chapter_lines = "\n".join(
@@ -204,6 +214,12 @@ def _build_content(
             for c in yt_chapters
         )
         header += f"\nYOUTUBE CHAPTERS (use these as natural section breaks):\n{chapter_lines}\n"
+
+    if ai_notes:
+        trimmed_notes = ai_notes[:1500].rstrip()
+        if len(ai_notes) > 1500:
+            trimmed_notes += "…"
+        header += f"\nTEAMS AI NOTES (use as additional context, not as a replacement for your own analysis):\n{trimmed_notes}\n"
 
     header += "\nTRANSCRIPT (timestamps and speakers):\n" + transcript + "\n\nCANDIDATE SCREENSHOTS (evaluate each for usefulness):\n"
 
