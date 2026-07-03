@@ -5,12 +5,12 @@ import time
 
 
 MODEL = "claude-sonnet-4-6"
-MAX_SCREENSHOTS = 20
+MAX_SCREENSHOTS = 30
 # Estimated input tokens threshold above which we chunk (conservative for 30K TPM Tier 1)
 _TOKEN_THRESHOLD = 20000
-# chars / 4 ≈ tokens; 640px image ≈ 350 tokens
+# chars / 4 ≈ tokens; 1000px image ≈ 750 tokens
 _CHARS_PER_TOKEN = 4
-_TOKENS_PER_IMAGE = 350
+_TOKENS_PER_IMAGE = 750
 MAX_RETRIES = 3
 _RETRY_BASE_WAIT = 60  # seconds; doubles each attempt
 
@@ -32,6 +32,10 @@ def generate_notes(
 
     transcript_text = _build_transcript(segments)
     top_frames = frames[:MAX_SCREENSHOTS]
+    # Global 1-based index used in prompts and returned as screenshot_idx;
+    # must match the docx writer's enumeration of the frames list.
+    for i, frame in enumerate(top_frames):
+        frame["idx"] = i + 1
 
     if progress_cb:
         progress_cb(10)
@@ -76,18 +80,19 @@ def _generate_chunked(
     chunk1_segs = [s for s in segments if s["start"] < midpoint]
     chunk2_segs = [s for s in segments if s["start"] >= midpoint]
 
-    # Distribute frames evenly between chunks (up to half of MAX_SCREENSHOTS each)
+    # Distribute frames between chunks (up to half of MAX_SCREENSHOTS each).
+    # Frames keep their global "idx", so no index remapping is needed and
+    # screenshot_idx always refers to the same enumeration the docx writer uses.
     per_chunk = MAX_SCREENSHOTS // 2
     chunk1_frames = [f for f in frames if f["timestamp"] < midpoint][:per_chunk]
     chunk2_frames = [f for f in frames if f["timestamp"] >= midpoint][:per_chunk]
-    chunk2_frame_offset = len(chunk1_frames)  # for remapping screenshot_idx
 
     all_chapters = []
     title = video_title
 
-    for i, (chunk_segs, chunk_frames, offset) in enumerate([
-        (chunk1_segs, chunk1_frames, 0),
-        (chunk2_segs, chunk2_frames, chunk2_frame_offset),
+    for i, (chunk_segs, chunk_frames) in enumerate([
+        (chunk1_segs, chunk1_frames),
+        (chunk2_segs, chunk2_frames),
     ]):
         if not chunk_segs:
             continue
@@ -115,10 +120,7 @@ def _generate_chunked(
         if i == 0:
             title = chunk_notes.get("title", video_title)
 
-        chapters = chunk_notes.get("chapters", [])
-        if offset:
-            chapters = _remap_screenshot_indices(chapters, offset)
-        all_chapters.extend(chapters)
+        all_chapters.extend(chunk_notes.get("chapters", []))
 
         if progress_cb:
             progress_cb(50 + i * 40)
@@ -127,15 +129,6 @@ def _generate_chunked(
         return _fallback_notes(video_title, segments)
 
     return {"title": title, "chapters": all_chapters}
-
-
-def _remap_screenshot_indices(chapters: list[dict], offset: int) -> list[dict]:
-    for chapter in chapters:
-        for point in chapter.get("key_points", []):
-            idx = point.get("screenshot_idx")
-            if idx is not None:
-                point["screenshot_idx"] = idx + offset
-    return chapters
 
 
 def _call_with_retry(client, content):
@@ -228,11 +221,12 @@ def _build_content(
     for i, frame in enumerate(frames):
         if progress_cb:
             progress_cb(10 + int((i / len(frames)) * 40))
-        img_b64 = _encode_image(frame["path"])
+        img_b64 = _encode_image(frame.get("api_path", frame["path"]))
         if img_b64 is None:
             continue
         ts = _format_ts(frame["timestamp"])
-        content.append({"type": "text", "text": f"Screenshot {i + 1} (at {ts}):"})
+        idx = frame.get("idx", i + 1)
+        content.append({"type": "text", "text": f"Screenshot {idx} (at {ts}):"})
         content.append({
             "type": "image",
             "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64},
@@ -298,11 +292,16 @@ Rules:
 - If YouTube chapters are provided, use them as chapter boundaries (title and timing); otherwise identify 4-8 natural chapters based on topic transitions
 - Each chapter needs 4-8 key points as concise, informative bullets
 - Wrap key concepts, jargon, names, and important terms in **double asterisks**
-- screenshot_idx: use the screenshot number (1-based integer) if that screenshot clearly
-  illustrates the key point (diagrams, code, slides with data). Use null otherwise.
-- Each screenshot number should appear at most once across all key points
-- Only reference screenshots showing slides, diagrams, code, or meaningful visuals —
-  not talking heads or blurry frames
+- screenshot_idx: the screenshot number shown above each image (integer), or null.
+  Screenshots are highly valuable to the reader — attach one to EVERY key point it
+  illustrates or accompanies. Valuable screenshots include ANY screen content shown
+  in the presentation: slides, diagrams, charts, code editors, terminals, browser
+  windows, dashboards, application demos, and documents.
+- Aim to reference MOST of the provided screenshots. The screenshots were pre-filtered
+  to likely-useful frames, so err on the side of including them. Only skip a screenshot
+  if it is a talking head, blank, blurry, or a near-duplicate of one already used.
+- Each screenshot number may appear at most once across all key points; if needed,
+  add a key point summarizing what a screenshot shows so it can be included
 - Preserve accurate speaker attribution per chapter
 - start_time and end_time are in seconds (floats)
 

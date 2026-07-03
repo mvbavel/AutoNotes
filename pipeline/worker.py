@@ -2,8 +2,13 @@ import os
 import re
 import shutil
 import tempfile
+from datetime import datetime
 
 from PyQt6.QtCore import QThread, pyqtSignal
+
+# Debug artifacts from the most recent run (log + selected frames),
+# kept outside the temp dir so they survive pipeline cleanup
+DEBUG_DIR = os.path.expanduser("~/Library/Logs/AutoNotes")
 
 from pipeline.downloader import download_youtube, find_transcript
 from pipeline.teams_downloader import is_teams_url, download_teams_recording
@@ -164,8 +169,17 @@ class ProcessingWorker(QThread):
         # ── Stage 5: Frame extraction ─────────────────────────────────────
         self._stage(5, total)
         self._log("Extracting and scoring candidate screenshots…")
-        frames = extract_frames(video_path, temp_dir, progress_cb=self._progress)
-        self._log(f"Selected {len(frames)} candidate screenshots")
+        frames = extract_frames(
+            video_path, temp_dir,
+            progress_cb=self._progress,
+            segments=segments,
+        )
+        cropped_count = sum(1 for f in frames if f.get("cropped"))
+        self._log(
+            f"Selected {len(frames)} candidate screenshots "
+            f"({cropped_count} cropped to detected presentation screen)"
+        )
+        self._save_debug_frames(frames)
 
         # ── Stage 6: AI note generation ───────────────────────────────────
         self._stage(6, total)
@@ -180,7 +194,11 @@ class ProcessingWorker(QThread):
             ai_notes=ai_notes,
         )
         chapters = notes.get("chapters", [])
-        self._log(f"Generated {len(chapters)} chapters")
+        cited = sum(
+            1 for ch in chapters for kp in ch.get("key_points", [])
+            if kp.get("screenshot_idx") is not None
+        )
+        self._log(f"Generated {len(chapters)} chapters ({cited} screenshots referenced in notes)")
 
         # ── Stage 7: Write DOCX ───────────────────────────────────────────
         self._stage(7, total)
@@ -202,6 +220,26 @@ class ProcessingWorker(QThread):
 
     def _log(self, msg: str):
         self.log_message.emit(msg)
+        try:
+            os.makedirs(DEBUG_DIR, exist_ok=True)
+            with open(os.path.join(DEBUG_DIR, "autonotes.log"), "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+        except OSError:
+            pass
+
+    def _save_debug_frames(self, frames: list[dict]):
+        """Copy selected screenshots to the debug dir (replacing the last run's)."""
+        try:
+            dest = os.path.join(DEBUG_DIR, "last_run_frames")
+            shutil.rmtree(dest, ignore_errors=True)
+            os.makedirs(dest, exist_ok=True)
+            for i, frame in enumerate(frames):
+                ts = int(frame["timestamp"])
+                crop = "_cropped" if frame.get("cropped") else ""
+                name = f"{i + 1:02d}_t{ts // 60:02d}m{ts % 60:02d}s{crop}.jpg"
+                shutil.copy(frame["path"], os.path.join(dest, name))
+        except OSError:
+            pass
 
 
 def _safe_filename(name: str) -> str:

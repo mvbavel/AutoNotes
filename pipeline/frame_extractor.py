@@ -5,15 +5,45 @@ import numpy as np
 
 from pipeline._paths import FFMPEG, FFPROBE
 
-MAX_FRAMES = 25
-INTERVAL_SECONDS = 10
+MAX_FRAMES = 40           # scored candidates kept after dedup
+INTERVAL_SECONDS = 5      # frame sampling interval
+EXTRACT_WIDTH = 1280      # width frames are extracted at; DOCX embeds full res
+API_MAX_WIDTH = 1000      # downscaled copy sent to Claude (controls token cost)
+
+# Fraction of significantly-changed pixels (256x144 grayscale, per-pixel
+# threshold 20) below which two frames are considered the same slide/scene
+# and collapsed into one candidate. Must stay sensitive enough to catch a
+# single bullet point appearing (~0.006) or a line being reworded (~0.003);
+# identical frames re-encoded measure 0.000.
+_SAME_SLIDE_DIFF = 0.002
+_SIG_SIZE = (256, 144)
+_SIG_PIXEL_THRESH = 20
+
+# Score bonus for frames near a transcript segment containing a visual cue
+_CUE_BONUS = 0.05
+_CUE_PHRASES = (
+    "slide", "screen", "diagram", "chart", "graph", "figure", "table",
+    "as you can see", "you can see", "shown here", "this shows",
+    "look at", "looking at", "demo", "example", "code", "here we have",
+    "terminal", "console", "browser", "dashboard", "window", "if i click",
+    "when i click", "let me show", "i'll show", "pull up", "switch to",
+)
+
+# Bonus when the frame was cropped to a detected physical screen — a screen
+# being shown is itself evidence the frame matters, whatever it displays
+_CROP_BONUS = 0.05
 
 
-def extract_frames(video_path: str, temp_dir: str, progress_cb=None) -> list[dict]:
+def extract_frames(video_path: str, temp_dir: str, progress_cb=None,
+                   segments: list[dict] | None = None) -> list[dict]:
     """
-    Extract candidate frames from the video, score them for slide-likeness,
+    Extract candidate frames from the video, crop to a detected presentation
+    screen where possible, collapse near-duplicate slides, score for
+    slide-likeness (with a bonus near visual-cue transcript moments),
     and return the top MAX_FRAMES sorted by timestamp.
-    Returns list of {timestamp, path, score}.
+    Returns list of {timestamp, path, api_path, score, cropped}: "path" is
+    the full-resolution image (embedded in the DOCX), "api_path" a copy
+    downscaled to API_MAX_WIDTH (sent to Claude).
     """
     import cv2
 
@@ -24,21 +54,57 @@ def extract_frames(video_path: str, temp_dir: str, progress_cb=None) -> list[dic
     if duration <= 0:
         return []
 
-    timestamps = list(range(0, int(duration), INTERVAL_SECONDS))
-    candidates = []
+    _extract_all_frames(video_path, frames_dir, duration, progress_cb)
 
-    for i, ts in enumerate(timestamps):
-        frame_path = os.path.join(frames_dir, f"frame_{ts:06d}.jpg")
-        _extract_frame(video_path, ts, frame_path)
-        if os.path.exists(frame_path):
-            score = _score_frame(frame_path)
-            candidates.append({"timestamp": ts, "path": frame_path, "score": score})
+    frame_files = sorted(
+        f for f in os.listdir(frames_dir)
+        if f.startswith("frame_") and f.endswith(".jpg")
+    )
+    if not frame_files:
+        return []
+
+    cue_windows = _cue_windows(segments)
+
+    # Score every frame (cropping to the presentation screen when detected),
+    # grouping consecutive near-identical frames so each slide/scene
+    # contributes only its best-scoring frame.
+    groups: list[dict] = []          # best candidate per slide group
+    prev_hash = None
+
+    for i, fname in enumerate(frame_files):
+        ts = _frame_index_to_ts(fname)
+        path = os.path.join(frames_dir, fname)
+        result = _process_frame(cv2, path)
+        if result is None:
+            continue
+        score, img_hash, cropped = result
+
+        if _in_cue_window(ts, cue_windows):
+            score += _CUE_BONUS
+
+        candidate = {"timestamp": ts, "path": path, "score": score,
+                     "cropped": cropped}
+
+        if prev_hash is not None and _frame_diff(img_hash, prev_hash) < _SAME_SLIDE_DIFF:
+            # Same slide as previous frame — keep whichever scores higher
+            if score > groups[-1]["score"]:
+                groups[-1] = candidate
+        else:
+            groups.append(candidate)
+        prev_hash = img_hash
+
         if progress_cb:
-            progress_cb(int((i + 1) / len(timestamps) * 100))
+            progress_cb(60 + int((i + 1) / len(frame_files) * 35))
 
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    top = candidates[:MAX_FRAMES]
+    groups.sort(key=lambda x: x["score"], reverse=True)
+    top = groups[:MAX_FRAMES]
     top.sort(key=lambda x: x["timestamp"])
+
+    for frame in top:
+        frame["api_path"] = _make_api_copy(cv2, frame["path"])
+
+    if progress_cb:
+        progress_cb(100)
     return top
 
 
@@ -56,42 +122,217 @@ def _get_duration(video_path: str) -> float:
         return 0.0
 
 
-def _extract_frame(video_path: str, timestamp: float, output_path: str):
+def _extract_all_frames(video_path: str, frames_dir: str, duration: float,
+                        progress_cb=None):
+    """Single decode pass sampling one frame every INTERVAL_SECONDS."""
+    pattern = os.path.join(frames_dir, "frame_%06d.jpg")
     cmd = [
-        FFMPEG, "-y", "-ss", str(timestamp), "-i", video_path,
-        "-vframes", "1", "-q:v", "3", "-vf", "scale=640:-1",
-        output_path
+        FFMPEG, "-y", "-i", video_path,
+        "-vf", f"fps=1/{INTERVAL_SECONDS},scale={EXTRACT_WIDTH}:-2",
+        "-q:v", "2",
+        "-progress", "pipe:1", "-nostats", "-loglevel", "error",
+        pattern,
     ]
-    subprocess.run(cmd, capture_output=True)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+    )
+    for line in proc.stdout:
+        # ffmpeg reports out_time_ms in microseconds
+        if line.startswith("out_time_ms=") and progress_cb:
+            try:
+                seconds = int(line.split("=", 1)[1]) / 1_000_000
+            except ValueError:
+                continue
+            progress_cb(min(60, int(seconds / duration * 60)))
+    proc.wait()
 
 
-def _score_frame(frame_path: str) -> float:
+def _frame_index_to_ts(fname: str) -> int:
+    # frame_000001.jpg is sampled at t=0, frame_000002 at t=INTERVAL, ...
+    idx = int(fname[len("frame_"):-len(".jpg")])
+    return (idx - 1) * INTERVAL_SECONDS
+
+
+def _process_frame(cv2, path: str):
     """
-    Score a frame for slide-likeness.
-    Slides have high edge density (text/diagrams) and low color complexity.
+    Score a frame, cropping to a detected presentation screen when that
+    improves it. Overwrites the file with the crop. Returns
+    (score, perceptual_hash, cropped) or None if unreadable.
+    The hash is computed on the full frame so dedup is stable even when
+    crop detection flickers between adjacent frames.
     """
-    import cv2
-
-    img = cv2.imread(frame_path)
+    img = cv2.imread(path)
     if img is None:
-        return 0.0
+        return None
 
+    img_hash = _frame_hash(cv2, img)
+    full_score = _score_image(cv2, img)
+
+    quad = _detect_screen_quad(cv2, img)
+    if quad is not None:
+        cropped = _warp_crop(cv2, img, quad)
+        # Accept the crop when it contains real content (edges): a blank
+        # wall, door, or window crop measures near zero. Don't require it
+        # to out-score the full frame — a busy demo screen in an otherwise
+        # calm room can legitimately score lower than its surroundings.
+        if cropped is not None and _edge_density(
+            cv2, cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+        ) >= 0.01:
+            crop_score = _score_image(cv2, cropped) + _CROP_BONUS
+            cv2.imwrite(path, cropped, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            return crop_score, img_hash, True
+
+    return full_score, img_hash, False
+
+
+def _detect_screen_quad(cv2, img):
+    """
+    Find the largest convex quadrilateral that plausibly is a presentation
+    screen / projected slide: 15–95% of the frame, screen-like aspect ratio,
+    and nearly rectangular. Returns a 4x2 float32 corner array or None.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    frame_area = img.shape[0] * img.shape[1]
+    best_quad = None
+    best_area = 0.0
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < 0.15 * frame_area or area > 0.95 * frame_area:
+            continue
+        peri = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+        if len(approx) != 4 or not cv2.isContourConvex(approx):
+            continue
+        x, y, w, h = cv2.boundingRect(approx)
+        if h == 0 or not (1.0 <= w / h <= 2.6):
+            continue
+        if area / (w * h) < 0.80:
+            continue
+        if area > best_area:
+            best_area = area
+            best_quad = approx.reshape(4, 2).astype(np.float32)
+
+    return best_quad
+
+
+def _warp_crop(cv2, img, quad):
+    """Perspective-correct the quad to an upright rectangle."""
+    ordered = _order_corners(quad)
+    (tl, tr, br, bl) = ordered
+    width = int(max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl)))
+    height = int(max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr)))
+    if width < 200 or height < 150:
+        return None
+    dst = np.array(
+        [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
+        dtype=np.float32,
+    )
+    matrix = cv2.getPerspectiveTransform(ordered, dst)
+    return cv2.warpPerspective(img, matrix, (width, height))
+
+
+def _order_corners(quad):
+    """Order 4 corners as top-left, top-right, bottom-right, bottom-left."""
+    sums = quad.sum(axis=1)
+    diffs = np.diff(quad, axis=1).flatten()
+    return np.array([
+        quad[np.argmin(sums)],   # top-left: smallest x+y
+        quad[np.argmin(diffs)],  # top-right: smallest y-x
+        quad[np.argmax(sums)],   # bottom-right: largest x+y
+        quad[np.argmax(diffs)],  # bottom-left: largest y-x
+    ], dtype=np.float32)
+
+
+def _frame_hash(cv2, img):
+    """Downsampled grayscale signature for near-duplicate detection."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return cv2.resize(gray, _SIG_SIZE, interpolation=cv2.INTER_AREA).astype(np.int16)
+
+
+def _frame_diff(a, b) -> float:
+    """Fraction of pixels that changed significantly between two signatures."""
+    return float(np.count_nonzero(np.abs(a - b) > _SIG_PIXEL_THRESH)) / a.size
+
+
+def _cue_windows(segments: list[dict] | None) -> list[tuple[float, float]]:
+    """Time windows around transcript moments that reference visuals."""
+    windows = []
+    for seg in segments or []:
+        text = seg.get("text", "").lower()
+        if any(phrase in text for phrase in _CUE_PHRASES):
+            windows.append((seg["start"] - 2.0, seg["start"] + 8.0))
+    return windows
+
+
+def _in_cue_window(ts: float, windows: list[tuple[float, float]]) -> bool:
+    return any(lo <= ts <= hi for lo, hi in windows)
+
+
+def _make_api_copy(cv2, path: str) -> str:
+    """
+    Write a copy downscaled to API_MAX_WIDTH for sending to Claude,
+    leaving the original at full resolution for the document.
+    Returns the copy's path (the original if already small enough).
+    """
+    img = cv2.imread(path)
+    if img is None:
+        return path
+    h, w = img.shape[:2]
+    if w <= API_MAX_WIDTH:
+        return path
+    new_h = int(h * API_MAX_WIDTH / w)
+    small = cv2.resize(img, (API_MAX_WIDTH, new_h), interpolation=cv2.INTER_AREA)
+    api_path = path[:-len(".jpg")] + "_api.jpg"
+    cv2.imwrite(api_path, small, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return api_path
+
+
+def _score_image(cv2, img) -> float:
+    """
+    Score an image for screen-content likeness: slides, demos, terminals,
+    code editors, browsers, dashboards. What all of these share — and what
+    camera shots of people/rooms lack — is dense, crisp, axis-aligned edge
+    structure (text and rectilinear UI).
+    """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Edge density: slides have lots of crisp text edges
-    edges = cv2.Canny(gray, 50, 150)
-    edge_density = float(np.sum(edges > 0)) / edges.size
+    # Edge density: text and UI produce lots of crisp edges (10%+ = max)
+    edge_component = min(_edge_density(cv2, gray) / 0.10, 1.0)
+
+    # Rectilinearity: fraction of strong gradients aligned to the axes.
+    # Screen content measures 0.8+; natural images sit near the 0.33 baseline.
+    rectilinearity = _rectilinearity(cv2, gray)
 
     # Color simplicity: quantize to 32x32 and count unique colors
     small = cv2.resize(img, (32, 32))
-    pixels = small.reshape(-1, 3)
-    unique = len(set(map(tuple, map(tuple, pixels))))
+    unique = len(set(map(tuple, small.reshape(-1, 3))))
     color_simplicity = 1.0 - (unique / (32 * 32))
 
-    # Uniform background detection: large areas of near-uniform color
-    # Slide backgrounds are typically very uniform
-    std_dev = float(np.std(gray))
-    uniformity = max(0.0, 1.0 - std_dev / 80.0)
+    # Uniform regions (slide/terminal backgrounds); busy demos score low
+    # here, which is why this carries the smallest weight
+    uniformity = max(0.0, 1.0 - float(np.std(gray)) / 80.0)
 
-    score = edge_density * 0.6 + color_simplicity * 0.25 + uniformity * 0.15
-    return score
+    return (edge_component * 0.4 + rectilinearity * 0.25
+            + color_simplicity * 0.2 + uniformity * 0.15)
+
+
+def _edge_density(cv2, gray) -> float:
+    edges = cv2.Canny(gray, 50, 150)
+    return float(np.sum(edges > 0)) / edges.size
+
+
+def _rectilinearity(cv2, gray) -> float:
+    """Fraction of strong-gradient pixels within 15° of horizontal/vertical."""
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1)
+    strong = np.hypot(gx, gy) > 60
+    if int(strong.sum()) < 500:
+        return 0.0
+    ang = np.arctan2(np.abs(gy[strong]), np.abs(gx[strong]))
+    to_axis = np.minimum(ang, np.pi / 2 - ang)
+    return float(np.mean(to_axis < np.radians(15)))
