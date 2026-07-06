@@ -7,7 +7,8 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
 
-def write_docx(notes: dict, frames: list[dict], output_dir: str, safe_title: str) -> str:
+def write_docx(notes: dict, frames: list[dict], output_dir: str, safe_title: str,
+               log_cb=None) -> str:
     """Build the DOCX from structured notes and return the output file path."""
     doc = Document()
     _setup_styles(doc)
@@ -17,7 +18,7 @@ def write_docx(notes: dict, frames: list[dict], output_dir: str, safe_title: str
     frames_by_idx = {i + 1: f["path"] for i, f in enumerate(frames)}
 
     for chapter in notes.get("chapters", []):
-        _add_chapter(doc, chapter, frames_by_idx)
+        _add_chapter(doc, chapter, frames_by_idx, log_cb)
 
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, f"{safe_title}_notes.docx")
@@ -39,7 +40,7 @@ def _add_title(doc: Document, title: str):
     doc.add_paragraph()
 
 
-def _add_chapter(doc: Document, chapter: dict, frames_by_idx: dict):
+def _add_chapter(doc: Document, chapter: dict, frames_by_idx: dict, log_cb=None):
     heading = doc.add_heading(chapter.get("title", ""), level=1)
     heading.runs[0].font.size = Pt(16)
 
@@ -55,7 +56,7 @@ def _add_chapter(doc: Document, chapter: dict, frames_by_idx: dict):
         screenshot_idx = point.get("screenshot_idx")
 
         if screenshot_idx is not None and screenshot_idx in frames_by_idx:
-            _add_screenshot(doc, frames_by_idx[screenshot_idx])
+            _add_screenshot(doc, frames_by_idx[screenshot_idx], log_cb)
 
         p = doc.add_paragraph(style="List Bullet")
         p.paragraph_format.left_indent = Inches(0.25)
@@ -64,14 +65,25 @@ def _add_chapter(doc: Document, chapter: dict, frames_by_idx: dict):
     doc.add_paragraph()
 
 
-def _add_screenshot(doc: Document, image_path: str):
+def _add_screenshot(doc: Document, image_path: str, log_cb=None):
+    para = doc.add_paragraph()
+    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = para.add_run()
     try:
-        para = doc.add_paragraph()
-        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = para.add_run()
         run.add_picture(image_path, width=Inches(5.5))
-    except Exception:
-        pass
+    except Exception as e:
+        # Safety net for image formats python-docx doesn't recognize
+        # (e.g. JPEGs without a JFIF marker): re-encode via Pillow and retry
+        try:
+            import io
+            from PIL import Image
+            buf = io.BytesIO()
+            Image.open(image_path).convert("RGB").save(buf, "JPEG", quality=92)
+            buf.seek(0)
+            run.add_picture(buf, width=Inches(5.5))
+        except Exception:
+            if log_cb:
+                log_cb(f"Skipped screenshot {image_path}: {type(e).__name__}: {e}")
 
 
 def _add_formatted_run(paragraph, text: str):

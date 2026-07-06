@@ -1,18 +1,24 @@
 import base64
 import json
 import os
+import re
 import time
 
 
-MODEL = "claude-sonnet-4-6"
+MODEL = os.environ.get("AUTONOTES_MODEL", "claude-sonnet-5")
 MAX_SCREENSHOTS = 30
-# Estimated input tokens threshold above which we chunk (conservative for 30K TPM Tier 1)
+# Estimated TRANSCRIPT tokens above which we split into two calls. Images are
+# deliberately excluded from this estimate: the ~22.5K tokens of a full image
+# set would otherwise trigger chunking on every real video, and chunking
+# degrades results (frames split unevenly, metadata only in chunk 1).
 _TOKEN_THRESHOLD = 20000
-# chars / 4 ≈ tokens; 1000px image ≈ 750 tokens
-_CHARS_PER_TOKEN = 4
-_TOKENS_PER_IMAGE = 750
+_CHARS_PER_TOKEN = 4  # chars / 4 ≈ tokens
 MAX_RETRIES = 3
 _RETRY_BASE_WAIT = 60  # seconds; doubles each attempt
+
+# Raw model responses land here for post-hoc debugging (same dir the worker
+# uses for its log and frame copies)
+_DEBUG_DIR = os.path.expanduser("~/Library/Logs/AutoNotes")
 
 
 def generate_notes(
@@ -25,6 +31,8 @@ def generate_notes(
     yt_chapters: list[dict] | None = None,
     attendees: list[str] | None = None,
     ai_notes: str | None = None,
+    cancel_check=None,
+    log_cb=None,
 ) -> dict:
     import anthropic
 
@@ -36,17 +44,19 @@ def generate_notes(
     # must match the docx writer's enumeration of the frames list.
     for i, frame in enumerate(top_frames):
         frame["idx"] = i + 1
+    valid_idx = {frame["idx"] for frame in top_frames}
 
     if progress_cb:
         progress_cb(10)
 
-    estimated_tokens = len(transcript_text) // _CHARS_PER_TOKEN + len(top_frames) * _TOKENS_PER_IMAGE
+    estimated_tokens = len(transcript_text) // _CHARS_PER_TOKEN
 
     if estimated_tokens > _TOKEN_THRESHOLD:
         notes = _generate_chunked(
             client, segments, top_frames, video_title, progress_cb,
             description=description, yt_chapters=yt_chapters,
             attendees=attendees, ai_notes=ai_notes,
+            cancel_check=cancel_check, log_cb=log_cb, valid_idx=valid_idx,
         )
     else:
         content = _build_content(
@@ -56,10 +66,11 @@ def generate_notes(
         )
         if progress_cb:
             progress_cb(60)
-        response = _call_with_retry(client, content)
+        response = _call_with_retry(client, content, cancel_check=cancel_check)
         if progress_cb:
             progress_cb(90)
-        notes = _parse_response(response, video_title, segments)
+        notes = _parse_response(response, video_title, segments,
+                                valid_idx=valid_idx, log_cb=log_cb, tag="single")
 
     if progress_cb:
         progress_cb(100)
@@ -70,6 +81,7 @@ def generate_notes(
 def _generate_chunked(
     client, segments, frames, video_title, progress_cb=None,
     description="", yt_chapters=None, attendees=None, ai_notes=None,
+    cancel_check=None, log_cb=None, valid_idx=None,
 ):
     """Split transcript and frames into two halves, call Claude once per half, merge."""
     if not segments:
@@ -109,13 +121,15 @@ def _generate_chunked(
 
         if i > 0:
             # Wait between chunks so we don't slam the TPM window
-            time.sleep(30)
+            _interruptible_sleep(30, cancel_check)
 
         if progress_cb:
             progress_cb(10 + i * 40)
 
-        response = _call_with_retry(client, content)
-        chunk_notes = _parse_response(response, video_title, chunk_segs)
+        response = _call_with_retry(client, content, cancel_check=cancel_check)
+        chunk_notes = _parse_response(response, video_title, chunk_segs,
+                                      valid_idx=valid_idx, log_cb=log_cb,
+                                      tag=f"chunk{i + 1}")
 
         if i == 0:
             title = chunk_notes.get("title", video_title)
@@ -131,36 +145,112 @@ def _generate_chunked(
     return {"title": title, "chapters": all_chapters}
 
 
-def _call_with_retry(client, content):
+def _call_with_retry(client, content, cancel_check=None):
     import anthropic
 
     last_exc = None
     for attempt in range(MAX_RETRIES):
+        if cancel_check:
+            cancel_check()
         try:
             return client.messages.create(
                 model=MODEL,
-                max_tokens=8192,
+                # thinking output shares this budget on claude-sonnet-5, so
+                # leave headroom beyond the ~2-4K tokens the JSON itself needs
+                max_tokens=16000,
                 system=_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": content}],
             )
-        except anthropic.RateLimitError as exc:
+        except (anthropic.RateLimitError,
+                anthropic.InternalServerError,
+                anthropic.APIConnectionError) as exc:
             last_exc = exc
             if attempt < MAX_RETRIES - 1:
                 wait = _RETRY_BASE_WAIT * (2 ** attempt)
-                time.sleep(wait)
+                _interruptible_sleep(wait, cancel_check)
 
     raise last_exc
 
 
-def _parse_response(response, video_title: str, segments: list[dict]) -> dict:
-    raw = response.content[0].text.strip()
+def _interruptible_sleep(seconds: float, cancel_check=None):
+    """Sleep in 1s slices so a cancel request isn't stuck behind a long wait."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if cancel_check:
+            cancel_check()
+        time.sleep(min(1.0, deadline - time.monotonic()))
+
+
+def _parse_response(response, video_title: str, segments: list[dict],
+                    valid_idx: set | None = None, log_cb=None,
+                    tag: str = "response") -> dict:
+    # claude-sonnet-5 runs adaptive thinking by default, so the text answer
+    # is not necessarily the first content block
+    raw = next((b.text for b in response.content if b.type == "text"), None)
+    if raw is None:
+        if log_cb:
+            log_cb(f"Claude response ({tag}) contained no text block — using fallback notes")
+        return _fallback_notes(video_title, segments)
+    raw = raw.strip()
+    _dump_debug(raw, tag)
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[1]
         raw = raw.rsplit("```", 1)[0]
     try:
-        return json.loads(raw)
+        notes = json.loads(raw)
     except json.JSONDecodeError:
+        if log_cb:
+            log_cb(f"Claude response ({tag}) was not valid JSON — using fallback "
+                   f"notes (raw saved to {_DEBUG_DIR})")
         return _fallback_notes(video_title, segments)
+    return _normalize_screenshot_refs(notes, valid_idx, log_cb=log_cb, tag=tag)
+
+
+def _normalize_screenshot_refs(notes: dict, valid_idx: set | None,
+                               log_cb=None, tag: str = "response") -> dict:
+    """Coerce screenshot_idx values to int and drop ones that don't reference
+    a provided screenshot, so bad references fail loudly instead of silently
+    producing a document with missing images."""
+    if valid_idx is None:
+        return notes
+    dropped = []
+    for chapter in notes.get("chapters", []):
+        for kp in chapter.get("key_points", []):
+            if not isinstance(kp, dict) or kp.get("screenshot_idx") is None:
+                continue
+            idx = _coerce_idx(kp["screenshot_idx"])
+            if idx not in valid_idx:
+                dropped.append(kp["screenshot_idx"])
+                idx = None
+            kp["screenshot_idx"] = idx
+    if dropped and log_cb:
+        log_cb(f"Dropped {len(dropped)} invalid screenshot reference(s) in {tag}: "
+               f"{dropped[:10]}{'…' if len(dropped) > 10 else ''}")
+    return notes
+
+
+def _coerce_idx(value):
+    """Best-effort conversion of screenshot_idx to int — models occasionally
+    return "5", "Screenshot 5", or 5.0 instead of a bare integer."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    m = re.search(r"\d+", str(value))
+    return int(m.group()) if m else None
+
+
+def _dump_debug(text: str, tag: str):
+    """Save the raw model output so citation problems can be diagnosed post-hoc."""
+    try:
+        os.makedirs(_DEBUG_DIR, exist_ok=True)
+        path = os.path.join(_DEBUG_DIR, f"last_claude_{tag}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError:
+        pass
 
 
 def _build_transcript(segments: list[dict]) -> str:

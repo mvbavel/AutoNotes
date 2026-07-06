@@ -19,6 +19,17 @@ _SAME_SLIDE_DIFF = 0.002
 _SIG_SIZE = (256, 144)
 _SIG_PIXEL_THRESH = 20
 
+# Region used for the dedup signature (x0, x1, y0, y1 as frame fractions).
+# Excludes the right-hand strip and the top/bottom edges, where Teams meeting
+# recordings place the live webcam gallery and speaker caption — constant
+# motion there would otherwise make every 5s sample look like a new slide.
+_SIG_REGION = (0.0, 0.78, 0.05, 0.92)
+
+# Minimum spacing between selected frames. Guarantees coverage across the
+# whole video: a burst of high-scoring frames (a demo with constant motion,
+# or dedup defeated by an unusual layout) can't crowd out slides elsewhere.
+MIN_GAP_SECONDS = 25
+
 # Score bonus for frames near a transcript segment containing a visual cue
 _CUE_BONUS = 0.05
 _CUE_PHRASES = (
@@ -35,7 +46,8 @@ _CROP_BONUS = 0.05
 
 
 def extract_frames(video_path: str, temp_dir: str, progress_cb=None,
-                   segments: list[dict] | None = None) -> list[dict]:
+                   segments: list[dict] | None = None,
+                   cancel_check=None) -> list[dict]:
     """
     Extract candidate frames from the video, crop to a detected presentation
     screen where possible, collapse near-duplicate slides, score for
@@ -54,7 +66,7 @@ def extract_frames(video_path: str, temp_dir: str, progress_cb=None,
     if duration <= 0:
         return []
 
-    _extract_all_frames(video_path, frames_dir, duration, progress_cb)
+    _extract_all_frames(video_path, frames_dir, duration, progress_cb, cancel_check)
 
     frame_files = sorted(
         f for f in os.listdir(frames_dir)
@@ -72,6 +84,8 @@ def extract_frames(video_path: str, temp_dir: str, progress_cb=None,
     prev_hash = None
 
     for i, fname in enumerate(frame_files):
+        if cancel_check:
+            cancel_check()
         ts = _frame_index_to_ts(fname)
         path = os.path.join(frames_dir, fname)
         result = _process_frame(cv2, path)
@@ -96,11 +110,15 @@ def extract_frames(video_path: str, temp_dir: str, progress_cb=None,
         if progress_cb:
             progress_cb(60 + int((i + 1) / len(frame_files) * 35))
 
-    groups.sort(key=lambda x: x["score"], reverse=True)
-    top = groups[:MAX_FRAMES]
-    top.sort(key=lambda x: x["timestamp"])
+    top = _select_top(groups, MAX_FRAMES, MIN_GAP_SECONDS)
 
     for frame in top:
+        # ffmpeg's mjpeg output lacks the JFIF/Exif marker python-docx
+        # requires; rewrite via cv2 so the DOCX embed can't reject it
+        if _needs_jfif_rewrite(frame["path"]):
+            img = cv2.imread(frame["path"])
+            if img is not None:
+                cv2.imwrite(frame["path"], img, [cv2.IMWRITE_JPEG_QUALITY, 92])
         frame["api_path"] = _make_api_copy(cv2, frame["path"])
 
     if progress_cb:
@@ -123,7 +141,7 @@ def _get_duration(video_path: str) -> float:
 
 
 def _extract_all_frames(video_path: str, frames_dir: str, duration: float,
-                        progress_cb=None):
+                        progress_cb=None, cancel_check=None):
     """Single decode pass sampling one frame every INTERVAL_SECONDS."""
     pattern = os.path.join(frames_dir, "frame_%06d.jpg")
     cmd = [
@@ -136,15 +154,22 @@ def _extract_all_frames(video_path: str, frames_dir: str, duration: float,
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
     )
-    for line in proc.stdout:
-        # ffmpeg reports out_time_ms in microseconds
-        if line.startswith("out_time_ms=") and progress_cb:
-            try:
-                seconds = int(line.split("=", 1)[1]) / 1_000_000
-            except ValueError:
-                continue
-            progress_cb(min(60, int(seconds / duration * 60)))
-    proc.wait()
+    try:
+        for line in proc.stdout:
+            if cancel_check:
+                cancel_check()
+            # ffmpeg reports out_time_ms in microseconds
+            if line.startswith("out_time_ms=") and progress_cb:
+                try:
+                    seconds = int(line.split("=", 1)[1]) / 1_000_000
+                except ValueError:
+                    continue
+                progress_cb(min(60, int(seconds / duration * 60)))
+        proc.wait()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
 
 
 def _frame_index_to_ts(fname: str) -> int:
@@ -248,9 +273,44 @@ def _order_corners(quad):
     ], dtype=np.float32)
 
 
+def _select_top(groups: list[dict], max_frames: int, min_gap: float) -> list[dict]:
+    """
+    Pick the highest-scoring frames subject to a minimum time gap between
+    picks, then fill any remaining slots by score alone (short videos may not
+    have max_frames gap-respecting candidates). Returned sorted by timestamp.
+    """
+    by_score = sorted(groups, key=lambda g: g["score"], reverse=True)
+    picked: list[dict] = []
+    picked_ids: set[int] = set()
+
+    for cand in by_score:
+        if len(picked) >= max_frames:
+            break
+        if all(abs(cand["timestamp"] - p["timestamp"]) >= min_gap for p in picked):
+            picked.append(cand)
+            picked_ids.add(id(cand))
+
+    for cand in by_score:
+        if len(picked) >= max_frames:
+            break
+        if id(cand) not in picked_ids:
+            picked.append(cand)
+            picked_ids.add(id(cand))
+
+    picked.sort(key=lambda g: g["timestamp"])
+    return picked
+
+
 def _frame_hash(cv2, img):
-    """Downsampled grayscale signature for near-duplicate detection."""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    """Downsampled grayscale signature for near-duplicate detection.
+
+    Computed on the central content region only (_SIG_REGION), so webcam
+    tiles and captions at the frame edges don't register as slide changes.
+    """
+    h, w = img.shape[:2]
+    x0, x1, y0, y1 = _SIG_REGION
+    region = img[int(h * y0):int(h * y1), int(w * x0):int(w * x1)]
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
     return cv2.resize(gray, _SIG_SIZE, interpolation=cv2.INTER_AREA).astype(np.int16)
 
 
@@ -271,6 +331,21 @@ def _cue_windows(segments: list[dict] | None) -> list[tuple[float, float]]:
 
 def _in_cue_window(ts: float, windows: list[tuple[float, float]]) -> bool:
     return any(lo <= ts <= hi for lo, hi in windows)
+
+
+def _needs_jfif_rewrite(path: str) -> bool:
+    """True for JPEGs lacking a JFIF/Exif APP marker.
+
+    ffmpeg's mjpeg encoder emits JPEGs that open with a comment segment
+    ("Lavc…") instead of an APP0/APP1 marker; OpenCV reads them fine but
+    python-docx raises UnrecognizedImageError on embed.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(10)
+    except OSError:
+        return False
+    return head[:2] == b"\xff\xd8" and head[6:10] not in (b"JFIF", b"Exif")
 
 
 def _make_api_copy(cv2, path: str) -> str:
