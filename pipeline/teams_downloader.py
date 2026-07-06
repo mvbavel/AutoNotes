@@ -1,11 +1,13 @@
 """Download Teams/SharePoint recordings via yt-dlp with browser cookies."""
 import glob
+import json
 import os
 import re
 import subprocess
 
 from pipeline._paths import FFMPEG, _find_binary
-from pipeline.vtt_parser import parse_vtt
+from pipeline._util import safe_filename
+from pipeline.vtt_parser import parse_srt, parse_vtt
 
 YTDLP = _find_binary("yt-dlp")
 
@@ -28,6 +30,7 @@ def download_teams_recording(
     output_dir: str,
     progress_cb=None,
     log_cb=None,
+    cancel_check=None,
 ) -> dict:
     """Download a Teams/SharePoint recording and return a context dict.
 
@@ -54,9 +57,8 @@ def download_teams_recording(
         result["description"] = info.get("description") or ""
         result["duration"] = float(info.get("duration") or 0)
 
-    safe_title = _safe_filename(result["title"])
+    safe_title = safe_filename(result["title"])
     out_template = os.path.join(output_dir, f"{safe_title}.%(ext)s")
-    out_path = os.path.join(output_dir, f"{safe_title}.mp4")
 
     ffmpeg_dir = os.path.dirname(FFMPEG)
 
@@ -64,7 +66,9 @@ def download_teams_recording(
     for browser in _BROWSERS:
         if log_cb:
             log_cb(f"Attempting download with {browser} cookies…")
-        ok = _run_download(url, out_template, ffmpeg_dir, browser, log_cb)
+        ok = _run_download(url, out_template, ffmpeg_dir, browser,
+                           progress_cb=progress_cb, log_cb=log_cb,
+                           cancel_check=cancel_check)
         if ok:
             success = True
             break
@@ -85,7 +89,7 @@ def download_teams_recording(
     if progress_cb:
         progress_cb(80)
 
-    # Parse any downloaded VTT/SRT subtitle file
+    # Parse any downloaded VTT/SRT subtitle file (VTT preferred: keeps speaker tags)
     vtt_files = glob.glob(os.path.join(output_dir, "*.vtt"))
     srt_files = glob.glob(os.path.join(output_dir, "*.srt"))
 
@@ -100,10 +104,9 @@ def download_teams_recording(
             if log_cb:
                 log_cb(f"VTT parse failed: {e}")
     elif srt_files:
-        from pipeline.downloader import _parse_srt
         if log_cb:
             log_cb("Parsing SRT transcript…")
-        result["transcript_segments"] = _parse_srt(srt_files[0])
+        result["transcript_segments"] = parse_srt(srt_files[0])
 
     if progress_cb:
         progress_cb(100)
@@ -115,24 +118,29 @@ def download_teams_recording(
 
 def _fetch_info(url: str, log_cb=None) -> dict | None:
     for browser in _BROWSERS:
+        cmd = [
+            YTDLP,
+            "--cookies-from-browser", browser,
+            "--dump-single-json",
+            "--no-playlist",
+            url,
+        ]
         try:
-            cmd = [
-                YTDLP,
-                "--cookies-from-browser", browser,
-                "--dump-single-json",
-                "--no-playlist",
-                url,
-            ]
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             if out.returncode == 0:
-                import json
                 return json.loads(out.stdout)
-        except Exception:
-            pass
+            if log_cb:
+                err = (out.stderr or "").strip().splitlines()
+                log_cb(f"Metadata fetch with {browser} cookies failed"
+                       + (f": {err[-1]}" if err else ""))
+        except Exception as e:
+            if log_cb:
+                log_cb(f"Metadata fetch with {browser} cookies failed: {e}")
     return None
 
 
-def _run_download(url: str, out_template: str, ffmpeg_dir: str, browser: str, log_cb=None) -> bool:
+def _run_download(url: str, out_template: str, ffmpeg_dir: str, browser: str,
+                  progress_cb=None, log_cb=None, cancel_check=None) -> bool:
     cmd = [
         YTDLP,
         "--cookies-from-browser", browser,
@@ -140,27 +148,38 @@ def _run_download(url: str, out_template: str, ffmpeg_dir: str, browser: str, lo
         "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
         "--merge-output-format", "mp4",
         "--ffmpeg-location", ffmpeg_dir,
+        # Keep subtitles in VTT where possible — Teams VTT carries speaker tags
+        # that parse_vtt() needs; converting to SRT would destroy them
         "--write-sub",
         "--write-auto-sub",
         "--sub-langs", "en.*",
-        "--convert-subs", "srt",
-        "--write-sub",          # also try VTT natively
         "--sub-format", "vtt/srt/best",
         "--newline",
         "--progress",
         "-o", out_template,
         url,
     ]
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-        if log_cb and proc.stdout:
-            for line in proc.stdout.splitlines()[-10:]:
-                if line.strip():
-                    log_cb(line.strip())
-        return proc.returncode == 0
+        for line in proc.stdout:
+            if cancel_check:
+                cancel_check()
+            line = line.rstrip()
+            if not line:
+                continue
+            m = re.search(r"(\d+(?:\.\d+)?)%", line)
+            if m:
+                pct = min(int(float(m.group(1)) * 0.8), 80)  # download = 0-80% of stage
+                if progress_cb:
+                    progress_cb(pct)
+            elif log_cb and not line.startswith("[debug]"):
+                log_cb(line)
+        proc.wait()
     except Exception:
-        return False
-
-
-def _safe_filename(name: str) -> str:
-    return re.sub(r'[\\/*?:"<>|]', "_", name)[:80].strip()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        raise
+    return proc.returncode == 0

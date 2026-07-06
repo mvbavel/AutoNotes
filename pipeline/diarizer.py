@@ -1,4 +1,5 @@
-def diarize(audio_path: str, segments: list[dict], hf_token, progress_cb=None) -> list[dict]:
+def diarize(audio_path: str, segments: list[dict], hf_token,
+            progress_cb=None, log_cb=None) -> list[dict]:
     """
     Add speaker labels to transcript segments using pyannote.audio.
     Falls back to a single 'Speaker' label if token is missing or diarization fails.
@@ -41,16 +42,23 @@ def diarize(audio_path: str, segments: list[dict], hf_token, progress_cb=None) -
         return result
 
     except Exception as e:
-        # Non-fatal: fall back to unlabeled
+        # Non-fatal: fall back to unlabeled, but tell the user why
+        if log_cb:
+            log_cb(f"Speaker diarization failed ({type(e).__name__}: {e}) — "
+                   "continuing without speaker labels")
         return [dict(s, speaker="Speaker") for s in segments]
 
 
 def _build_speaker_map(diarization) -> list[tuple]:
     """Convert pyannote diarization to list of (start, end, speaker)."""
+    labels: dict[str, str] = {}   # per-run mapping so labels never leak across videos
     turns = []
     for turn, _, speaker in diarization.itertracks(yield_label=True):
-        label = _friendly_label(speaker)
-        turns.append((turn.start, turn.end, label))
+        if speaker not in labels:
+            idx = len(labels)
+            labels[speaker] = (_SPEAKER_NAMES[idx] if idx < len(_SPEAKER_NAMES)
+                               else f"Speaker {idx + 1}")
+        turns.append((turn.start, turn.end, labels[speaker]))
     return turns
 
 
@@ -65,11 +73,3 @@ _SPEAKER_NAMES = [
     "Speaker A", "Speaker B", "Speaker C", "Speaker D",
     "Speaker E", "Speaker F", "Speaker G", "Speaker H",
 ]
-_label_cache: dict[str, str] = {}
-
-
-def _friendly_label(raw: str) -> str:
-    if raw not in _label_cache:
-        idx = len(_label_cache)
-        _label_cache[raw] = _SPEAKER_NAMES[idx] if idx < len(_SPEAKER_NAMES) else f"Speaker {idx + 1}"
-    return _label_cache[raw]

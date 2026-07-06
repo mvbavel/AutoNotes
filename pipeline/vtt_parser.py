@@ -1,4 +1,5 @@
-"""Parse WebVTT transcript files (including Teams-format with speaker tags)."""
+"""Parse subtitle transcripts: WebVTT (including Teams-format with speaker tags) and SRT."""
+import json
 import re
 
 
@@ -27,8 +28,8 @@ def parse_vtt(path: str) -> list[dict]:
         if not m:
             continue
 
-        start = _vtt_ts(m.group(1))
-        end = _vtt_ts(m.group(2))
+        start = _ts_to_secs(m.group(1))
+        end = _ts_to_secs(m.group(2))
 
         # Join remaining lines after the timestamp as the cue text
         cue_lines = [l for l in lines if l != ts_line and not l.strip().isdigit()]
@@ -44,16 +45,46 @@ def parse_vtt(path: str) -> list[dict]:
     return _merge_consecutive(segments)
 
 
+def parse_srt(path: str) -> list[dict]:
+    """Parse an SRT file into [{start, end, text}] segments."""
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+
+    segments = []
+    for block in re.split(r"\n\n+", content.strip()):
+        lines = block.strip().splitlines()
+        if len(lines) < 3:
+            continue
+        ts_match = re.match(
+            r"(\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,\.]\d{3})",
+            lines[1],
+        )
+        if not ts_match:
+            continue
+        start = _ts_to_secs(ts_match.group(1))
+        end = _ts_to_secs(ts_match.group(2))
+        text = " ".join(lines[2:])
+        text = re.sub(r"<[^>]+>", "", text)  # strip any inline HTML tags
+        text = re.sub(r"\s+", " ", text).strip()
+        if text:
+            segments.append({"start": start, "end": end, "text": text})
+
+    return segments
+
+
 def _extract_speaker_map(content: str) -> dict:
     """Parse Teams NOTE speaker-list block: {"speakersRaw":[{"id":0,"name":"..."}]}"""
-    import json
-    m = re.search(r'NOTE speaker-list\s*(\{.*?\})', content, re.S)
-    if not m:
+    idx = content.find("NOTE speaker-list")
+    if idx == -1:
+        return {}
+    brace = content.find("{", idx)
+    if brace == -1:
         return {}
     try:
-        data = json.loads(m.group(1))
+        # raw_decode handles the nested braces a regex can't balance
+        data, _ = json.JSONDecoder().raw_decode(content[brace:])
         return {str(s["id"]): s["name"] for s in data.get("speakersRaw", [])}
-    except Exception:
+    except (ValueError, KeyError, TypeError):
         return {}
 
 
@@ -80,7 +111,7 @@ def _merge_consecutive(segments: list[dict]) -> list[dict]:
     return merged
 
 
-def _vtt_ts(ts: str) -> float:
+def _ts_to_secs(ts: str) -> float:
     ts = ts.replace(",", ".")
     parts = ts.split(":")
     h, m, s = int(parts[0]), int(parts[1]), float(parts[2])

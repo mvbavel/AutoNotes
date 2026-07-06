@@ -26,6 +26,7 @@ def get_token(client_id: str, log_cb=None) -> str:
 
     cache = msal.SerializableTokenCache()
     if os.path.exists(_CACHE_PATH):
+        os.chmod(_CACHE_PATH, 0o600)  # tighten perms for caches written by older versions
         with open(_CACHE_PATH) as f:
             cache.deserialize(f.read())
 
@@ -44,9 +45,10 @@ def get_token(client_id: str, log_cb=None) -> str:
     if "access_token" not in result:
         raise RuntimeError(f"Graph auth failed: {result.get('error_description', result)}")
 
-    # Persist updated cache
+    # Persist updated cache (owner-only: it holds refresh tokens)
     if cache.has_state_changed:
-        with open(_CACHE_PATH, "w") as f:
+        fd = os.open(_CACHE_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(cache.serialize())
 
     return result["access_token"]
@@ -79,7 +81,7 @@ def _get_raw(token: str, path: str) -> bytes:
 
 # ── Meeting lookup ─────────────────────────────────────────────────────────────
 
-def find_meeting(token: str, join_url: str) -> dict | None:
+def find_meeting(token: str, join_url: str, log_cb=None) -> dict | None:
     """Look up a Teams online meeting by its join URL."""
     try:
         data = _get(token, "/me/onlineMeetings", {
@@ -87,11 +89,13 @@ def find_meeting(token: str, join_url: str) -> dict | None:
         })
         meetings = data.get("value", [])
         return meetings[0] if meetings else None
-    except Exception:
+    except Exception as e:
+        if log_cb:
+            log_cb(f"Meeting lookup failed: {e}")
         return None
 
 
-def get_attendees_from_calendar(token: str, join_url: str) -> list[str]:
+def get_attendees_from_calendar(token: str, join_url: str, log_cb=None) -> list[str]:
     """Find meeting in calendar and return attendee display names."""
     try:
         # Search recent calendar events for one whose online meeting URL matches
@@ -109,12 +113,13 @@ def get_attendees_from_calendar(token: str, join_url: str) -> list[str]:
                     for a in event.get("attendees", [])
                     if a.get("emailAddress", {}).get("name")
                 ]
-    except Exception:
-        pass
+    except Exception as e:
+        if log_cb:
+            log_cb(f"Calendar attendee lookup failed: {e}")
     return []
 
 
-def get_transcript_vtt(token: str, meeting_id: str) -> str | None:
+def get_transcript_vtt(token: str, meeting_id: str, log_cb=None) -> str | None:
     """Return the VTT content of the first transcript for a meeting, or None."""
     try:
         data = _get(token, f"/me/onlineMeetings/{meeting_id}/transcripts")
@@ -124,17 +129,21 @@ def get_transcript_vtt(token: str, meeting_id: str) -> str | None:
         tid = transcripts[0]["id"]
         raw = _get_raw(token, f"/me/onlineMeetings/{meeting_id}/transcripts/{tid}/content")
         return raw.decode("utf-8", errors="replace")
-    except Exception:
+    except Exception as e:
+        if log_cb:
+            log_cb(f"Transcript fetch failed: {e}")
         return None
 
 
-def get_ai_notes(token: str, meeting_id: str) -> str | None:
+def get_ai_notes(token: str, meeting_id: str, log_cb=None) -> str | None:
     """Return Teams AI-generated meeting recap text, or None if unavailable."""
     try:
         data = _get(token, f"/me/onlineMeetings/{meeting_id}/meetingInfo")
         recap = data.get("recap") or data.get("meetingNotes") or ""
         return recap.strip() or None
-    except Exception:
+    except Exception as e:
+        if log_cb:
+            log_cb(f"AI notes fetch failed: {e}")
         return None
 
 
@@ -158,7 +167,7 @@ def fetch_meeting_context(client_id: str, join_url: str, log_cb=None) -> dict:
     if log_cb:
         log_cb("Fetching Teams meeting metadata from Microsoft Graph…")
 
-    meeting = find_meeting(token, join_url)
+    meeting = find_meeting(token, join_url, log_cb=log_cb)
     if meeting:
         ctx["title"] = meeting.get("subject")
         meeting_id = meeting.get("id")
@@ -167,14 +176,14 @@ def fetch_meeting_context(client_id: str, join_url: str, log_cb=None) -> dict:
 
         if log_cb:
             log_cb("Fetching meeting transcript…")
-        ctx["transcript_vtt"] = get_transcript_vtt(token, meeting_id)
+        ctx["transcript_vtt"] = get_transcript_vtt(token, meeting_id, log_cb=log_cb)
         if ctx["transcript_vtt"]:
             if log_cb:
                 log_cb("Transcript retrieved from Graph API")
 
         if log_cb:
             log_cb("Fetching AI notes…")
-        ctx["ai_notes"] = get_ai_notes(token, meeting_id)
+        ctx["ai_notes"] = get_ai_notes(token, meeting_id, log_cb=log_cb)
         if ctx["ai_notes"]:
             if log_cb:
                 log_cb("Teams AI notes retrieved")
@@ -182,7 +191,7 @@ def fetch_meeting_context(client_id: str, join_url: str, log_cb=None) -> dict:
         if log_cb:
             log_cb("Meeting not found via join URL — fetching attendees from calendar only")
 
-    ctx["attendees"] = get_attendees_from_calendar(token, join_url)
+    ctx["attendees"] = get_attendees_from_calendar(token, join_url, log_cb=log_cb)
     if ctx["attendees"] and log_cb:
         log_cb(f"Attendees: {', '.join(ctx['attendees'])}")
 

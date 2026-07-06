@@ -8,3 +8,4 @@ opencv-python-headless>=4.8.0
 yt-dlp>=2024.1.0
 msal>=1.28.0
 requests>=2.31.0
+keyring>=25.0.0

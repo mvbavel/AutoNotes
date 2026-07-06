@@ -5,8 +5,12 @@ import re
 import subprocess
 
 from pipeline._paths import FFMPEG, _find_binary
+from pipeline._util import safe_filename
+from pipeline.vtt_parser import parse_srt
 
 YTDLP = _find_binary("yt-dlp")
+
+_METADATA_TIMEOUT = 60  # seconds for the yt-dlp metadata fetch
 
 _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -23,7 +27,7 @@ _BASE_ARGS = [
 
 
 def download_youtube(
-    url: str, output_dir: str, progress_cb=None, log_cb=None
+    url: str, output_dir: str, progress_cb=None, log_cb=None, cancel_check=None
 ) -> tuple[str, str, str, list]:
     """Download a YouTube video and return (file_path, title, description, chapters).
 
@@ -34,7 +38,7 @@ def download_youtube(
     title = info.get("title", "video")
     description = info.get("description", "") or ""
     chapters = info.get("chapters") or []
-    safe_title = _safe_filename(title)
+    safe_title = safe_filename(title)
     out_template = os.path.join(output_dir, f"{safe_title}.%(ext)s")
     out_path = os.path.join(output_dir, f"{safe_title}.mp4")
 
@@ -66,20 +70,27 @@ def download_youtube(
         stderr=subprocess.STDOUT,
         text=True,
     )
-    for line in proc.stdout:
-        line = line.rstrip()
-        if not line:
-            continue
-        m = re.search(r"(\d+(?:\.\d+)?)%", line)
-        if m:
-            pct = min(int(float(m.group(1))), 100)
-            if progress_cb:
-                progress_cb(pct)
-            if log_cb:
-                log_cb(f"Downloading: {m.group(1)}%")
-        elif log_cb and not line.startswith("[debug]"):
-            log_cb(line)
-    proc.wait()
+    try:
+        for line in proc.stdout:
+            if cancel_check:
+                cancel_check()
+            line = line.rstrip()
+            if not line:
+                continue
+            m = re.search(r"(\d+(?:\.\d+)?)%", line)
+            if m:
+                pct = min(int(float(m.group(1))), 100)
+                if progress_cb:
+                    progress_cb(pct)
+                if log_cb:
+                    log_cb(f"Downloading: {m.group(1)}%")
+            elif log_cb and not line.startswith("[debug]"):
+                log_cb(line)
+        proc.wait()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
     if proc.returncode != 0:
         raise RuntimeError(f"yt-dlp exited with code {proc.returncode}")
 
@@ -94,45 +105,15 @@ def find_transcript(output_dir: str) -> list[dict] | None:
     srt_files = glob.glob(os.path.join(output_dir, "*.srt"))
     if not srt_files:
         return None
-    segments = _parse_srt(srt_files[0])
+    segments = parse_srt(srt_files[0])
     return segments if segments else None
 
 
-def _parse_srt(path: str) -> list[dict]:
-    """Parse an SRT file into [{start, end, text}] segments."""
-    with open(path, encoding="utf-8") as f:
-        content = f.read()
-
-    segments = []
-    for block in re.split(r"\n\n+", content.strip()):
-        lines = block.strip().splitlines()
-        if len(lines) < 3:
-            continue
-        ts_match = re.match(
-            r"(\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,\.]\d{3})",
-            lines[1],
-        )
-        if not ts_match:
-            continue
-        start = _srt_ts_to_secs(ts_match.group(1))
-        end = _srt_ts_to_secs(ts_match.group(2))
-        text = " ".join(lines[2:])
-        text = re.sub(r"<[^>]+>", "", text)  # strip any inline HTML tags
-        text = re.sub(r"\s+", " ", text).strip()
-        if text:
-            segments.append({"start": start, "end": end, "text": text})
-
-    return segments
-
-
-def _srt_ts_to_secs(ts: str) -> float:
-    ts = ts.replace(",", ".")
-    h, m, s = ts.split(":")
-    return int(h) * 3600 + int(m) * 60 + float(s)
-
-
 def _run_json(cmd: list[str]) -> dict:
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=_METADATA_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"yt-dlp metadata fetch timed out after {_METADATA_TIMEOUT}s")
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "yt-dlp metadata fetch failed")
     # Find the JSON line (last non-empty line)
@@ -140,7 +121,3 @@ def _run_json(cmd: list[str]) -> dict:
         if line.strip().startswith("{"):
             return json.loads(line)
     raise RuntimeError("No JSON output from yt-dlp")
-
-
-def _safe_filename(name: str) -> str:
-    return re.sub(r'[\\/*?:"<>|]', "_", name)[:80]
