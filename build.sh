@@ -38,7 +38,7 @@ if [[ -d "$APP" ]]; then
     echo ""
     echo "  To open:       open \"$APP\""
     echo "  To distribute: share dist/AutoNotes.dmg"
-    echo "  To install:    cp -r \"$APP\" /Applications/"
+    echo "  To install:    ditto \"$APP\" /Applications/AutoNotes.app   (NOT cp -r — it breaks symlinks)"
 else
     echo "Build failed — no .app produced."
     exit 1

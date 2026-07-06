@@ -20,7 +20,9 @@ rm -f "$DMG_OUT"
 STAGING=$(mktemp -d)
 trap 'rm -rf "$STAGING"' EXIT
 
-cp -r "$APP" "$STAGING/"
+# ditto preserves the app's internal symlinks (cp -r follows them, which
+# flattens the Qt framework structure and makes the app crash at launch)
+ditto "$APP" "$STAGING/AutoNotes.app"
 ln -s /Applications "$STAGING/Applications"
 
 echo "Creating DMG (this takes a minute for large apps)…"
