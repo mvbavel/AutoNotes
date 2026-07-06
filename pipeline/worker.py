@@ -1,15 +1,13 @@
+import json
 import os
-import re
 import shutil
 import tempfile
+import traceback
 from datetime import datetime
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
-# Debug artifacts from the most recent run (log + selected frames),
-# kept outside the temp dir so they survive pipeline cleanup
-DEBUG_DIR = os.path.expanduser("~/Library/Logs/AutoNotes")
-
+from pipeline._util import PipelineCancelled, safe_filename
 from pipeline.downloader import download_youtube, find_transcript
 from pipeline.teams_downloader import is_teams_url, download_teams_recording
 from pipeline.transcriber import extract_audio, transcribe
@@ -17,6 +15,10 @@ from pipeline.diarizer import diarize
 from pipeline.frame_extractor import extract_frames
 from pipeline.note_generator import generate_notes
 from output.docx_writer import write_docx
+
+# Debug artifacts from the most recent run (log + selected frames),
+# kept outside the temp dir so they survive pipeline cleanup
+DEBUG_DIR = os.path.expanduser("~/Library/Logs/AutoNotes")
 
 
 class ProcessingWorker(QThread):
@@ -49,9 +51,12 @@ class ProcessingWorker(QThread):
         temp_dir = tempfile.mkdtemp(prefix="autonotes_")
         try:
             self._run_pipeline(temp_dir)
+        except PipelineCancelled:
+            self._log("Processing cancelled.")
         except Exception as e:
+            self._log(f"Pipeline error:\n{traceback.format_exc()}")
             if not self._cancelled:
-                self.error.emit(str(e))
+                self.error.emit(f"{type(e).__name__}: {e}")
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -73,6 +78,7 @@ class ProcessingWorker(QThread):
                 self.input_source, temp_dir,
                 progress_cb=self._progress,
                 log_cb=self._log,
+                cancel_check=self._check_cancel,
             )
             video_path = teams["video_path"]
             title = teams["title"]
@@ -90,8 +96,7 @@ class ProcessingWorker(QThread):
                 # Graph transcript takes priority over yt-dlp VTT
                 if ctx["transcript_vtt"]:
                     from pipeline.vtt_parser import parse_vtt
-                    import tempfile as _tf, os as _os
-                    tmp_vtt = _os.path.join(temp_dir, "graph_transcript.vtt")
+                    tmp_vtt = os.path.join(temp_dir, "graph_transcript.vtt")
                     with open(tmp_vtt, "w", encoding="utf-8") as f:
                         f.write(ctx["transcript_vtt"])
                     parsed = parse_vtt(tmp_vtt)
@@ -109,6 +114,7 @@ class ProcessingWorker(QThread):
                 self.input_source, temp_dir,
                 progress_cb=self._progress,
                 log_cb=self._log,
+                cancel_check=self._check_cancel,
             )
             if yt_chapters:
                 self._log(f"Found {len(yt_chapters)} YouTube chapters")
@@ -118,7 +124,23 @@ class ProcessingWorker(QThread):
             self._progress(100)
 
         self._log(f"Video: {title}")
-        safe_title = _safe_filename(title)
+        safe_title = safe_filename(title)
+
+        # Optional: reuse the transcript saved by a previous run (skips audio
+        # extraction, Whisper, and diarization). A transcript that came with
+        # the download (Teams VTT / Graph) still takes priority.
+        if self.config.get("reuse_transcript") and pre_segments is None:
+            saved_segments, meta = load_saved_transcript()
+            if saved_segments:
+                pre_segments = saved_segments
+                src = meta.get("video", "")
+                self._log(f"Reusing saved transcript ({len(saved_segments)} segments"
+                          + (f", from '{src}'" if src else "") + ")")
+                if src and src != title:
+                    self._log(f"WARNING: saved transcript is from a different video "
+                              f"('{src}') — uncheck 'Reuse last transcript' if unintended")
+            else:
+                self._log("No saved transcript found — transcribing normally")
 
         # ── Stage 2: Audio extraction (skip if transcript already available) ──
         self._stage(2, total)
@@ -136,10 +158,14 @@ class ProcessingWorker(QThread):
                 audio_path = None
             else:
                 self._log("No transcript available — extracting audio…")
-                audio_path = extract_audio(video_path, temp_dir, progress_cb=self._progress)
+                audio_path = extract_audio(video_path, temp_dir,
+                                           progress_cb=self._progress,
+                                           cancel_check=self._check_cancel)
         else:
             self._log("Extracting audio track…")
-            audio_path = extract_audio(video_path, temp_dir, progress_cb=self._progress)
+            audio_path = extract_audio(video_path, temp_dir,
+                                       progress_cb=self._progress,
+                                       cancel_check=self._check_cancel)
 
         # ── Stage 3: Transcription ────────────────────────────────────────
         self._stage(3, total)
@@ -150,7 +176,10 @@ class ProcessingWorker(QThread):
         else:
             model = self.config.get("whisper_model", "medium")
             self._log(f"Transcribing with Whisper ({model})… (this may take a while)")
-            segments = transcribe(audio_path, model_size=model, progress_cb=self._progress)
+            segments = transcribe(audio_path, model_size=model,
+                                  progress_cb=self._progress,
+                                  cancel_check=self._check_cancel,
+                                  log_cb=self._log)
             self._log(f"Transcription: {len(segments)} segments")
 
         # ── Stage 4: Speaker diarization ──────────────────────────────────
@@ -161,10 +190,14 @@ class ProcessingWorker(QThread):
             self._progress(100)
         elif hf_token:
             self._log("Identifying speakers with pyannote…")
-            segments = diarize(audio_path, segments, hf_token, progress_cb=self._progress)
+            segments = diarize(audio_path, segments, hf_token,
+                               progress_cb=self._progress, log_cb=self._log)
         else:
             self._log("No HuggingFace token — skipping speaker diarization")
-            segments = diarize(audio_path, segments, None, progress_cb=self._progress)
+            segments = diarize(audio_path, segments, None,
+                               progress_cb=self._progress, log_cb=self._log)
+
+        self._save_debug_transcript(segments, title)
 
         # ── Stage 5: Frame extraction ─────────────────────────────────────
         self._stage(5, total)
@@ -173,6 +206,7 @@ class ProcessingWorker(QThread):
             video_path, temp_dir,
             progress_cb=self._progress,
             segments=segments,
+            cancel_check=self._check_cancel,
         )
         cropped_count = sum(1 for f in frames if f.get("cropped"))
         self._log(
@@ -192,6 +226,8 @@ class ProcessingWorker(QThread):
             yt_chapters=yt_chapters or None,
             attendees=attendees or None,
             ai_notes=ai_notes,
+            cancel_check=self._check_cancel,
+            log_cb=self._log,
         )
         chapters = notes.get("chapters", [])
         cited = sum(
@@ -204,13 +240,18 @@ class ProcessingWorker(QThread):
         self._stage(7, total)
         self._log("Writing document…")
         output_dir = self.config.get("output_dir", os.path.expanduser("~/Desktop"))
-        out_path = write_docx(notes, frames, output_dir, safe_title)
+        out_path = write_docx(notes, frames, output_dir, safe_title, log_cb=self._log)
         self._progress(100)
         self._log(f"Saved: {out_path}")
 
         self.completed.emit(out_path)
 
+    def _check_cancel(self):
+        if self._cancelled:
+            raise PipelineCancelled()
+
     def _stage(self, n: int, total: int):
+        self._check_cancel()
         label = self.STAGES[n - 1]
         self.stage_changed.emit(label, n, total)
         self._log(f"[{n}/{total}] {label}")
@@ -225,6 +266,23 @@ class ProcessingWorker(QThread):
             with open(os.path.join(DEBUG_DIR, "autonotes.log"), "a", encoding="utf-8") as f:
                 f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
         except OSError:
+            pass
+
+    def _save_debug_transcript(self, segments: list[dict], title: str):
+        """Persist the transcript so a later-stage failure doesn't cost the
+        (potentially hours-long) transcription again on a retry."""
+        try:
+            os.makedirs(DEBUG_DIR, exist_ok=True)
+            path = os.path.join(DEBUG_DIR, "last_transcript.json")
+            data = {
+                "video": title,
+                "saved": datetime.now().isoformat(timespec="seconds"),
+                "segments": segments,
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+            self._log(f"Transcript saved to {path}")
+        except (OSError, TypeError):
             pass
 
     def _save_debug_frames(self, frames: list[dict]):
@@ -242,5 +300,22 @@ class ProcessingWorker(QThread):
             pass
 
 
-def _safe_filename(name: str) -> str:
-    return re.sub(r'[\\/*?:"<>|]', "_", name)[:80]
+def load_saved_transcript() -> tuple[list[dict], dict]:
+    """Load the transcript saved by a previous run.
+
+    Returns (segments, metadata); ([], {}) if absent or unreadable. Handles
+    both the current {"video", "saved", "segments"} format and the bare
+    segment list written by 1.4.4.
+    """
+    path = os.path.join(DEBUG_DIR, "last_transcript.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return [], {}
+    if isinstance(data, list):
+        return data, {}
+    segments = data.get("segments")
+    if not isinstance(segments, list):
+        return [], {}
+    return segments, {k: v for k, v in data.items() if k != "segments"}

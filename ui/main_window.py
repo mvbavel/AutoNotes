@@ -7,10 +7,11 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QFileDialog,
     QComboBox, QTextEdit, QProgressBar, QGroupBox,
-    QFormLayout, QSplitter, QFrame, QSizePolicy,
+    QFormLayout, QSplitter, QFrame, QSizePolicy, QCheckBox,
 )
 
-from pipeline.worker import ProcessingWorker
+from pipeline.worker import ProcessingWorker, load_saved_transcript
+from ui.secure_store import load_secret, save_secret
 from version import __version__
 
 
@@ -20,6 +21,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("AutoNotes")
         self.setMinimumSize(900, 680)
         self._worker = None
+        self._local_file = ""
+        self._out_path = ""
+        self._current_stage = 1
+        self._total_stages = len(ProcessingWorker.STAGES)
         self._settings = QSettings("AutoNotes", "AutoNotes")
         self._build_ui()
         self._load_settings()
@@ -119,6 +124,13 @@ class MainWindow(QMainWindow):
         hint.setStyleSheet("color: #888; font-size: 10px;")
         form.addRow("", hint)
 
+        self.reuse_transcript_check = QCheckBox("Reuse last transcript (skip transcription)")
+        form.addRow("", self.reuse_transcript_check)
+
+        self.reuse_info_label = QLabel("")
+        self.reuse_info_label.setStyleSheet("color: #888; font-size: 10px;")
+        form.addRow("", self.reuse_info_label)
+
         # ── Microsoft Teams / Graph API (optional) ────────────────────────
         teams_header = QLabel("Microsoft Teams (optional)")
         teams_header.setStyleSheet("color: #aaa; font-size: 10px; font-weight: bold; margin-top: 6px;")
@@ -190,7 +202,7 @@ class MainWindow(QMainWindow):
         stages_layout.setSpacing(4)
 
         self.stage_labels: list[QLabel] = []
-        stage_names = [
+        self._stage_names = [
             "Download / load video",
             "Extract audio",
             "Transcribe speech",
@@ -199,11 +211,11 @@ class MainWindow(QMainWindow):
             "Generate AI notes",
             "Write document",
         ]
-        for name in stage_names:
-            lbl = QLabel(f"○  {name}")
-            lbl.setStyleSheet("color: #999; font-size: 12px;")
+        for name in self._stage_names:
+            lbl = QLabel()
             stages_layout.addWidget(lbl)
             self.stage_labels.append(lbl)
+            self._render_stage(lbl, name, "pending")
 
         layout.addWidget(stages_box)
 
@@ -235,6 +247,7 @@ class MainWindow(QMainWindow):
             "QPushButton { background: #34a853; color: white; border-radius: 6px; font-size: 13px; font-weight: bold; }"
             "QPushButton:hover { background: #288543; }"
         )
+        self.open_btn.clicked.connect(self._open_output)
         layout.addWidget(self.open_btn)
 
         return panel
@@ -242,7 +255,7 @@ class MainWindow(QMainWindow):
     # ── Slots ────────────────────────────────────────────────────────────
 
     def _on_input_changed(self):
-        has_input = bool(self.url_edit.text().strip()) or bool(getattr(self, "_local_file", ""))
+        has_input = bool(self.url_edit.text().strip()) or bool(self._local_file)
         has_key = bool(self.api_key_edit.text().strip())
         ready = has_input and has_key
         self.process_btn.setEnabled(ready)
@@ -280,13 +293,13 @@ class MainWindow(QMainWindow):
         self._reset_progress()
 
         url = self.url_edit.text().strip()
-        local = getattr(self, "_local_file", "")
-        source = url or local
+        source = url or self._local_file
 
         config = {
             "anthropic_key": self.api_key_edit.text().strip(),
             "hf_token": self.hf_token_edit.text().strip(),
             "whisper_model": self.model_combo.currentText(),
+            "reuse_transcript": self.reuse_transcript_check.isChecked(),
             "output_dir": self.output_dir_edit.text().strip() or os.path.expanduser("~/Desktop"),
             "ms_client_id": self.ms_client_id_edit.text().strip(),
             "ms_join_url": self.ms_join_url_edit.text().strip(),
@@ -298,6 +311,7 @@ class MainWindow(QMainWindow):
         self._worker.log_message.connect(self._on_log)
         self._worker.completed.connect(self._on_completed)
         self._worker.error.connect(self._on_error)
+        self._worker.finished.connect(self._set_idle)
 
         self.process_btn.setEnabled(False)
         self.cancel_btn.setVisible(True)
@@ -308,75 +322,102 @@ class MainWindow(QMainWindow):
         self.file_path_label.setStyleSheet("color: #1a73e8; font-size: 11px;")
 
     def _cancel_processing(self):
-        if self._worker:
+        if self._worker and self._worker.isRunning():
+            # Cooperative cancel: the worker checks the flag at safe points and
+            # kills its subprocesses; _set_idle runs when the thread finishes
             self._worker.cancel()
-            self._worker.terminate()
-        self._on_log("Cancelled by user.")
+            self.cancel_btn.setEnabled(False)
+            self.cancel_btn.setText("Cancelling…")
+            self._on_log("Cancelling — waiting for current step to stop…")
         self.file_path_label.setStyleSheet("color: #ffffff; font-size: 11px;")
-        self._set_idle()
+
+    def _render_stage(self, lbl: QLabel, name: str, state: str):
+        if state == "done":
+            lbl.setText(f"✓  {name}")
+            lbl.setStyleSheet("color: #34a853; font-size: 12px;")
+        elif state == "active":
+            lbl.setText(f"▶  {name}")
+            lbl.setStyleSheet("color: #1a73e8; font-size: 12px; font-weight: bold;")
+        else:
+            lbl.setText(f"○  {name}")
+            lbl.setStyleSheet("color: #999; font-size: 12px;")
 
     def _on_stage_changed(self, label: str, current: int, total: int):
+        self._current_stage = current
+        self._total_stages = total
         for i, lbl in enumerate(self.stage_labels):
             stage_n = i + 1
-            if stage_n < current:
-                lbl.setText(f"✓  {lbl.text()[3:]}")
-                lbl.setStyleSheet("color: #34a853; font-size: 12px;")
-            elif stage_n == current:
-                lbl.setText(f"▶  {lbl.text()[3:]}")
-                lbl.setStyleSheet("color: #1a73e8; font-size: 12px; font-weight: bold;")
-            else:
-                lbl.setStyleSheet("color: #999; font-size: 12px;")
+            state = ("done" if stage_n < current
+                     else "active" if stage_n == current
+                     else "pending")
+            self._render_stage(lbl, self._stage_names[i], state)
 
-        overall = int(((current - 1) / total) * 100)
-        self.progress_bar.setValue(overall)
+        self.progress_bar.setValue(int(((current - 1) / total) * 100))
 
     def _on_stage_progress(self, pct: int):
-        # Blend stage progress into overall
-        current_val = self.progress_bar.value()
-        self.progress_bar.setValue(max(current_val, pct // 10 + current_val))
+        # Overall = completed stages + fractional progress of the current one
+        overall = int(((self._current_stage - 1) + pct / 100) / self._total_stages * 100)
+        self.progress_bar.setValue(max(self.progress_bar.value(), overall))
 
     def _on_log(self, msg: str):
         self.log_text.append(msg)
 
     def _on_completed(self, out_path: str):
         self._on_log(f"\nDone! Output: {out_path}")
-        for lbl in self.stage_labels:
-            text = lbl.text()[3:]
-            lbl.setText(f"✓  {text}")
-            lbl.setStyleSheet("color: #34a853; font-size: 12px;")
+        for i, lbl in enumerate(self.stage_labels):
+            self._render_stage(lbl, self._stage_names[i], "done")
         self.progress_bar.setValue(100)
 
         self.file_path_label.setStyleSheet("color: #34a853; font-size: 11px;")
+        self._out_path = out_path
         self.open_btn.setVisible(True)
-        self.open_btn.clicked.connect(lambda: self._open_file(out_path))
-        self._set_idle()
 
     def _on_error(self, msg: str):
         self._on_log(f"\nERROR: {msg}")
-        self._set_idle()
 
     def _set_idle(self):
         self.cancel_btn.setVisible(False)
+        self.cancel_btn.setEnabled(True)
+        self.cancel_btn.setText("Cancel")
         self.process_btn.setEnabled(True)
+        self._refresh_transcript_info()
+
+    def _refresh_transcript_info(self):
+        """Enable the reuse checkbox only when a saved transcript exists,
+        and describe it so the user knows what they'd be reusing."""
+        segments, meta = load_saved_transcript()
+        if segments:
+            src = meta.get("video", "")
+            saved = meta.get("saved", "").replace("T", " ")
+            detail = f"'{src}', " if src else ""
+            when = f", saved {saved}" if saved else ""
+            self.reuse_transcript_check.setEnabled(True)
+            self.reuse_info_label.setText(
+                f"Available: {detail}{len(segments)} segments{when}")
+        else:
+            self.reuse_transcript_check.setEnabled(False)
+            self.reuse_transcript_check.setChecked(False)
+            self.reuse_info_label.setText(
+                "No saved transcript yet — one is kept after each transcription")
 
     def _reset_progress(self):
-        stage_names = [lbl.text()[3:] for lbl in self.stage_labels]
         for i, lbl in enumerate(self.stage_labels):
-            lbl.setText(f"○  {stage_names[i]}")
-            lbl.setStyleSheet("color: #999; font-size: 12px;")
+            self._render_stage(lbl, self._stage_names[i], "pending")
+        self._current_stage = 1
         self.progress_bar.setValue(0)
         self.log_text.clear()
         self.open_btn.setVisible(False)
 
-    def _open_file(self, path: str):
-        subprocess.run(["open", path])
+    def _open_output(self):
+        if self._out_path:
+            subprocess.run(["open", self._out_path])
 
     # ── Settings persistence ─────────────────────────────────────────────
 
     def _save_settings(self):
         s = self._settings
-        s.setValue("api_key", self.api_key_edit.text())
-        s.setValue("hf_token", self.hf_token_edit.text())
+        save_secret(s, "api_key", self.api_key_edit.text())
+        save_secret(s, "hf_token", self.hf_token_edit.text())
         s.setValue("whisper_model", self.model_combo.currentText())
         s.setValue("output_dir", self.output_dir_edit.text())
         s.setValue("ms_client_id", self.ms_client_id_edit.text())
@@ -384,8 +425,8 @@ class MainWindow(QMainWindow):
 
     def _load_settings(self):
         s = self._settings
-        self.api_key_edit.setText(s.value("api_key", ""))
-        self.hf_token_edit.setText(s.value("hf_token", ""))
+        self.api_key_edit.setText(load_secret(s, "api_key"))
+        self.hf_token_edit.setText(load_secret(s, "hf_token"))
         model = s.value("whisper_model", "medium")
         idx = self.model_combo.findText(model)
         if idx >= 0:
@@ -396,3 +437,4 @@ class MainWindow(QMainWindow):
 
         # Refresh button state based on loaded settings
         self._on_input_changed()
+        self._refresh_transcript_info()
