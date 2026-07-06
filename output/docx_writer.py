@@ -16,9 +16,10 @@ def write_docx(notes: dict, frames: list[dict], output_dir: str, safe_title: str
     _add_title(doc, notes.get("title", safe_title))
 
     frames_by_idx = {i + 1: f["path"] for i, f in enumerate(frames)}
+    boxes = notes.get("screenshot_boxes") or {}
 
     for chapter in notes.get("chapters", []):
-        _add_chapter(doc, chapter, frames_by_idx, log_cb)
+        _add_chapter(doc, chapter, frames_by_idx, boxes, log_cb)
 
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, f"{safe_title}_notes.docx")
@@ -40,7 +41,8 @@ def _add_title(doc: Document, title: str):
     doc.add_paragraph()
 
 
-def _add_chapter(doc: Document, chapter: dict, frames_by_idx: dict, log_cb=None):
+def _add_chapter(doc: Document, chapter: dict, frames_by_idx: dict,
+                 boxes: dict, log_cb=None):
     heading = doc.add_heading(chapter.get("title", ""), level=1)
     heading.runs[0].font.size = Pt(16)
 
@@ -56,7 +58,8 @@ def _add_chapter(doc: Document, chapter: dict, frames_by_idx: dict, log_cb=None)
         screenshot_idx = point.get("screenshot_idx")
 
         if screenshot_idx is not None and screenshot_idx in frames_by_idx:
-            _add_screenshot(doc, frames_by_idx[screenshot_idx], log_cb)
+            _add_screenshot(doc, frames_by_idx[screenshot_idx],
+                            boxes.get(screenshot_idx), log_cb)
 
         p = doc.add_paragraph(style="List Bullet")
         p.paragraph_format.left_indent = Inches(0.25)
@@ -65,25 +68,43 @@ def _add_chapter(doc: Document, chapter: dict, frames_by_idx: dict, log_cb=None)
     doc.add_paragraph()
 
 
-def _add_screenshot(doc: Document, image_path: str, log_cb=None):
+def _add_screenshot(doc: Document, image_path: str, box=None, log_cb=None):
+    """Embed a screenshot, cropped to its content_box when one was provided.
+
+    Fallback chain: cropped → full-frame Pillow re-encode (also covers JPEGs
+    without a JFIF marker that python-docx rejects) → skip with a log line.
+    """
     para = doc.add_paragraph()
     para.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = para.add_run()
     try:
-        run.add_picture(image_path, width=Inches(5.5))
+        if box:
+            run.add_picture(_image_stream(image_path, box), width=Inches(5.5))
+        else:
+            run.add_picture(image_path, width=Inches(5.5))
     except Exception as e:
-        # Safety net for image formats python-docx doesn't recognize
-        # (e.g. JPEGs without a JFIF marker): re-encode via Pillow and retry
         try:
-            import io
-            from PIL import Image
-            buf = io.BytesIO()
-            Image.open(image_path).convert("RGB").save(buf, "JPEG", quality=92)
-            buf.seek(0)
-            run.add_picture(buf, width=Inches(5.5))
+            run.add_picture(_image_stream(image_path, None), width=Inches(5.5))
         except Exception:
             if log_cb:
                 log_cb(f"Skipped screenshot {image_path}: {type(e).__name__}: {e}")
+
+
+def _image_stream(image_path: str, box):
+    """Return a JPEG BytesIO of the image, cropped to the fractional
+    [x0, y0, x1, y1] box when given."""
+    import io
+    from PIL import Image
+
+    img = Image.open(image_path)
+    if box:
+        w, h = img.size
+        x0, y0, x1, y1 = box
+        img = img.crop((round(x0 * w), round(y0 * h), round(x1 * w), round(y1 * h)))
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, "JPEG", quality=92)
+    buf.seek(0)
+    return buf
 
 
 def _add_formatted_run(paragraph, text: str):

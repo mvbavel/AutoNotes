@@ -15,6 +15,9 @@ _TOKEN_THRESHOLD = 20000
 _CHARS_PER_TOKEN = 4  # chars / 4 ≈ tokens
 MAX_RETRIES = 3
 _RETRY_BASE_WAIT = 60  # seconds; doubles each attempt
+# Smallest plausible content_box area (fraction of the frame); anything
+# smaller is treated as a bad crop and the frame embeds uncropped
+_MIN_BOX_AREA = 0.25
 
 # Raw model responses land here for post-hoc debugging (same dir the worker
 # uses for its log and frame copies)
@@ -100,6 +103,7 @@ def _generate_chunked(
     chunk2_frames = [f for f in frames if f["timestamp"] >= midpoint][:per_chunk]
 
     all_chapters = []
+    all_boxes: dict = {}
     title = video_title
 
     for i, (chunk_segs, chunk_frames) in enumerate([
@@ -135,6 +139,7 @@ def _generate_chunked(
             title = chunk_notes.get("title", video_title)
 
         all_chapters.extend(chunk_notes.get("chapters", []))
+        all_boxes.update(chunk_notes.get("screenshot_boxes", {}))
 
         if progress_cb:
             progress_cb(50 + i * 40)
@@ -142,7 +147,7 @@ def _generate_chunked(
     if not all_chapters:
         return _fallback_notes(video_title, segments)
 
-    return {"title": title, "chapters": all_chapters}
+    return {"title": title, "chapters": all_chapters, "screenshot_boxes": all_boxes}
 
 
 def _call_with_retry(client, content, cancel_check=None):
@@ -203,7 +208,8 @@ def _parse_response(response, video_title: str, segments: list[dict],
             log_cb(f"Claude response ({tag}) was not valid JSON — using fallback "
                    f"notes (raw saved to {_DEBUG_DIR})")
         return _fallback_notes(video_title, segments)
-    return _normalize_screenshot_refs(notes, valid_idx, log_cb=log_cb, tag=tag)
+    notes = _normalize_screenshot_refs(notes, valid_idx, log_cb=log_cb, tag=tag)
+    return _normalize_content_boxes(notes, valid_idx)
 
 
 def _normalize_screenshot_refs(notes: dict, valid_idx: set | None,
@@ -227,6 +233,40 @@ def _normalize_screenshot_refs(notes: dict, valid_idx: set | None,
         log_cb(f"Dropped {len(dropped)} invalid screenshot reference(s) in {tag}: "
                f"{dropped[:10]}{'…' if len(dropped) > 10 else ''}")
     return notes
+
+
+def _normalize_content_boxes(notes: dict, valid_idx: set | None) -> dict:
+    """Validate the per-screenshot "screenshots" map from Claude into
+    notes["screenshot_boxes"]: {int idx: [x0, y0, x1, y1] fractions}.
+    Invalid, implausible, or missing boxes are simply absent — the docx
+    writer then embeds that frame uncropped, so a bad box can only ever
+    make a crop looser, never destroy an image."""
+    raw = notes.pop("screenshots", None)
+    boxes = notes.setdefault("screenshot_boxes", {})
+    if not isinstance(raw, dict):
+        return notes
+    for key, val in raw.items():
+        idx = _coerce_idx(key)
+        if idx is None or (valid_idx is not None and idx not in valid_idx):
+            continue
+        box = val.get("content_box") if isinstance(val, dict) else val
+        box = _valid_box(box)
+        if box:
+            boxes[idx] = box
+    return notes
+
+
+def _valid_box(box):
+    """Clamp and sanity-check a fractional [x0, y0, x1, y1] crop box."""
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        return None
+    try:
+        x0, y0, x1, y1 = (min(1.0, max(0.0, float(v))) for v in box)
+    except (TypeError, ValueError):
+        return None
+    if x1 <= x0 or y1 <= y0 or (x1 - x0) * (y1 - y0) < _MIN_BOX_AREA:
+        return None
+    return [x0, y0, x1, y1]
 
 
 def _coerce_idx(value):
@@ -375,7 +415,10 @@ Based on the transcript and screenshots, produce structured notes in this exact 
         }
       ]
     }
-  ]
+  ],
+  "screenshots": {
+    "1": {"content_box": [0.0, 0.05, 0.87, 0.94]}
+  }
 }
 
 Rules:
@@ -392,6 +435,15 @@ Rules:
   if it is a talking head, blank, blurry, or a near-duplicate of one already used.
 - Each screenshot number may appear at most once across all key points; if needed,
   add a key point summarizing what a screenshot shows so it can be included
+- For EVERY screenshot you reference, add an entry under "screenshots" whose
+  content_box is [left, top, right, bottom] as fractions (0.0–1.0) of the image,
+  tightly enclosing ONLY the meaningful display content — the shared slide, or the
+  page/app area of a shared window. EXCLUDE webcam/participant video tiles, meeting
+  captions and name labels, browser tab bars / address bars / bookmark bars, OS menu
+  bars, docks/taskbars, and black letterbox margins. If the entire image is content,
+  use [0.0, 0.0, 1.0, 1.0]
+- If a screenshot shows only meeting participants (webcam gallery) or contains no
+  meaningful screen content, do not reference it in any key point at all
 - Preserve accurate speaker attribution per chapter
 - start_time and end_time are in seconds (floats)
 

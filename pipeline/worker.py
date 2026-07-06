@@ -234,7 +234,9 @@ class ProcessingWorker(QThread):
             1 for ch in chapters for kp in ch.get("key_points", [])
             if kp.get("screenshot_idx") is not None
         )
-        self._log(f"Generated {len(chapters)} chapters ({cited} screenshots referenced in notes)")
+        boxes = notes.get("screenshot_boxes") or {}
+        self._log(f"Generated {len(chapters)} chapters ({cited} screenshots "
+                  f"referenced, {len(boxes)} with content crops)")
 
         # ── Stage 7: Write DOCX ───────────────────────────────────────────
         self._stage(7, total)
