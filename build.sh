@@ -6,12 +6,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-PYINSTALLER="$HOME/Library/Python/3.9/bin/pyinstaller"
-PYTHON="/usr/bin/python3"
+# Homebrew Python — the interpreter the app and all deps are installed on
+PYTHON="/opt/homebrew/bin/python3"
 
-if [[ ! -x "$PYINSTALLER" ]]; then
-    echo "Installing PyInstaller into Python 3.9…"
-    "$PYTHON" -m pip install pyinstaller --user
+if ! "$PYTHON" -m PyInstaller --version >/dev/null 2>&1; then
+    echo "Installing PyInstaller…"
+    "$PYTHON" -m pip install --break-system-packages pyinstaller
 fi
 
 if [[ "${1:-}" == "--clean" ]]; then
@@ -20,7 +20,7 @@ if [[ "${1:-}" == "--clean" ]]; then
 fi
 
 echo "Building AutoNotes.app — this will take several minutes…"
-"$PYINSTALLER" \
+"$PYTHON" -m PyInstaller \
     --noconfirm \
     --log-level WARN \
     AutoNotes.spec
