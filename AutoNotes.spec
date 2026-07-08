@@ -32,8 +32,15 @@ _anth_datas, _anth_binaries, _anth_hidden = collect_all('anthropic')
 _httpx_datas, _httpx_binaries, _httpx_hidden = collect_all('httpx')
 _httpcore_datas, _httpcore_binaries, _httpcore_hidden = collect_all('httpcore')
 
-# ── yt-dlp binary (invoked as subprocess; no Python module needed) ────────────
-_ytdlp_datas, _ytdlp_binaries, _ytdlp_hidden = [], [], []
+# ── yt-dlp: bundled as a Python package, invoked via `AutoNotes --yt-dlp`
+# (the Homebrew /opt/homebrew/bin/yt-dlp file is only a shim that needs a
+# Python environment the target machine won't have). Cryptodome is needed
+# for --cookies-from-browser chrome cookie decryption on macOS.
+_ytdlp_datas, _ytdlp_binaries, _ytdlp_hidden = collect_all('yt_dlp')
+_crypto_datas, _crypto_binaries, _crypto_hidden = collect_all('Cryptodome')
+_ytdlp_datas += _crypto_datas
+_ytdlp_binaries += _crypto_binaries
+_ytdlp_hidden += _crypto_hidden
 
 # ── Torch submodules (hooks-contrib handles core; we add explicit hidden) ─────
 _torch_hidden = collect_submodules('torch')
@@ -50,7 +57,6 @@ a = Analysis(
         [
             ('/opt/homebrew/bin/ffmpeg',  '.'),
             ('/opt/homebrew/bin/ffprobe', '.'),
-            ('/opt/homebrew/bin/yt-dlp',  '.'),
         ]
         + _ct2_binaries + _fw_binaries + _cv2_binaries
         + _pa_binaries + _anth_binaries + _httpx_binaries

@@ -43,7 +43,7 @@ Cancellation is cooperative: the worker raises `PipelineCancelled` (`pipeline/_u
 | Symbol | Location | Value |
 |---|---|---|
 | `FFMPEG` / `FFPROBE` | `transcriber.py`, `frame_extractor.py` | `/opt/homebrew/bin/ffmpeg` |
-| `YTDLP` | `downloader.py` | resolved at import time from a priority list |
+| `YTDLP_CMD` | `_paths.ytdlp_command()` | dev: system `yt-dlp`; frozen app: `[sys.executable, "--yt-dlp"]` re-exec running the bundled `yt_dlp` package (dispatch at the top of `main.py`) |
 | `MODEL` | `note_generator.py` | `"claude-sonnet-5"` (env override: `AUTONOTES_MODEL`) |
 | `MAX_FRAMES` | `frame_extractor.py` | `40` (scored candidates kept after dedup) |
 | `MAX_SCREENSHOTS` | `note_generator.py` | `30` (sent to Claude) |

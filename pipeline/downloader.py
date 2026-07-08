@@ -4,11 +4,11 @@ import os
 import re
 import subprocess
 
-from pipeline._paths import FFMPEG, _find_binary
+from pipeline._paths import FFMPEG, ytdlp_command
 from pipeline._util import safe_filename
 from pipeline.vtt_parser import parse_srt
 
-YTDLP = _find_binary("yt-dlp")
+YTDLP_CMD = ytdlp_command()
 
 _METADATA_TIMEOUT = 60  # seconds for the yt-dlp metadata fetch
 
@@ -34,7 +34,7 @@ def download_youtube(
     Also attempts to download subtitles (manual then auto-generated) as SRT files
     alongside the video. Callers can look for *.srt files in output_dir afterward.
     """
-    info = _run_json([YTDLP] + _BASE_ARGS + ["--dump-single-json", url])
+    info = _run_json(YTDLP_CMD + _BASE_ARGS + ["--dump-single-json", url])
     title = info.get("title", "video")
     description = info.get("description", "") or ""
     chapters = info.get("chapters") or []
@@ -44,7 +44,7 @@ def download_youtube(
 
     ffmpeg_dir = os.path.dirname(FFMPEG)
     dl_args = [
-        YTDLP,
+        *YTDLP_CMD,
         *_BASE_ARGS,
         "--format", (
             "bestvideo[ext=mp4]+bestaudio[ext=m4a]"

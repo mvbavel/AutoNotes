@@ -5,11 +5,11 @@ import os
 import re
 import subprocess
 
-from pipeline._paths import FFMPEG, _find_binary
+from pipeline._paths import FFMPEG, ytdlp_command
 from pipeline._util import safe_filename
 from pipeline.vtt_parser import parse_srt, parse_vtt
 
-YTDLP = _find_binary("yt-dlp")
+YTDLP_CMD = ytdlp_command()
 
 _TEAMS_PATTERNS = [
     r"teams\.microsoft\.com",
@@ -119,7 +119,7 @@ def download_teams_recording(
 def _fetch_info(url: str, log_cb=None) -> dict | None:
     for browser in _BROWSERS:
         cmd = [
-            YTDLP,
+            *YTDLP_CMD,
             "--cookies-from-browser", browser,
             "--dump-single-json",
             "--no-playlist",
@@ -142,7 +142,7 @@ def _fetch_info(url: str, log_cb=None) -> dict | None:
 def _run_download(url: str, out_template: str, ffmpeg_dir: str, browser: str,
                   progress_cb=None, log_cb=None, cancel_check=None) -> bool:
     cmd = [
-        YTDLP,
+        *YTDLP_CMD,
         "--cookies-from-browser", browser,
         "--no-playlist",
         "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
