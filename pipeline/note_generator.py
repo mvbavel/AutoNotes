@@ -6,10 +6,12 @@ import time
 
 
 MODEL = os.environ.get("AUTONOTES_MODEL", "claude-sonnet-5")
-MAX_SCREENSHOTS = 30
+# Matches frame_extractor.MAX_FRAMES: every selected frame is sent, since only
+# screenshots Claude sees can be referenced in the document
+MAX_SCREENSHOTS = 60
 # Estimated TRANSCRIPT tokens above which we split into two calls. Images are
-# deliberately excluded from this estimate: the ~22.5K tokens of a full image
-# set would otherwise trigger chunking on every real video, and chunking
+# deliberately excluded from this estimate: a full image set's token cost
+# would otherwise trigger chunking on every real video, and chunking
 # degrades results (frames split unevenly, metadata only in chunk 1).
 _TOKEN_THRESHOLD = 20000
 _CHARS_PER_TOKEN = 4  # chars / 4 ≈ tokens
@@ -69,7 +71,8 @@ def generate_notes(
         )
         if progress_cb:
             progress_cb(60)
-        response = _call_with_retry(client, content, cancel_check=cancel_check)
+        response = _call_with_retry(client, content, cancel_check=cancel_check,
+                                    log_cb=log_cb)
         if progress_cb:
             progress_cb(90)
         notes = _parse_response(response, video_title, segments,
@@ -130,7 +133,8 @@ def _generate_chunked(
         if progress_cb:
             progress_cb(10 + i * 40)
 
-        response = _call_with_retry(client, content, cancel_check=cancel_check)
+        response = _call_with_retry(client, content, cancel_check=cancel_check,
+                                    log_cb=log_cb)
         chunk_notes = _parse_response(response, video_title, chunk_segs,
                                       valid_idx=valid_idx, log_cb=log_cb,
                                       tag=f"chunk{i + 1}")
@@ -150,30 +154,51 @@ def _generate_chunked(
     return {"title": title, "chapters": all_chapters, "screenshot_boxes": all_boxes}
 
 
-def _call_with_retry(client, content, cancel_check=None):
+def _call_with_retry(client, content, cancel_check=None, log_cb=None):
     import anthropic
+    import httpx
+
+    # httpx.TransportError covers mid-stream failures (ReadError on a TCP
+    # reset, timeouts, RemoteProtocolError) that the SDK does NOT wrap in
+    # APIConnectionError once the stream is being iterated — without it a
+    # network blip minutes into a response kills the whole pipeline.
+    retryable = (anthropic.RateLimitError,
+                 anthropic.InternalServerError,
+                 anthropic.APIConnectionError,
+                 httpx.TransportError)
 
     last_exc = None
     for attempt in range(MAX_RETRIES):
         if cancel_check:
             cancel_check()
         try:
-            return client.messages.create(
+            # Streamed: max_tokens above ~16K needs streaming to avoid HTTP
+            # timeouts. Thinking shares this budget on claude-sonnet-5, and
+            # with 60 screenshots (analysis + content boxes) 16K proved too
+            # small — responses truncated mid-JSON or were all-thinking.
+            # Only generated tokens are billed, so the headroom is free.
+            with client.messages.stream(
                 model=MODEL,
-                # thinking output shares this budget on claude-sonnet-5, so
-                # leave headroom beyond the ~2-4K tokens the JSON itself needs
-                max_tokens=16000,
+                max_tokens=64000,
                 system=_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": content}],
-            )
-        except (anthropic.RateLimitError,
-                anthropic.InternalServerError,
-                anthropic.APIConnectionError) as exc:
+            ) as stream:
+                for _event in stream:
+                    if cancel_check:
+                        cancel_check()
+                return stream.get_final_message()
+        except retryable as exc:
             last_exc = exc
             if attempt < MAX_RETRIES - 1:
                 wait = _RETRY_BASE_WAIT * (2 ** attempt)
+                if log_cb:
+                    log_cb(f"API call failed ({type(exc).__name__}) — "
+                           f"retrying in {int(wait)}s (attempt {attempt + 2}/{MAX_RETRIES})")
                 _interruptible_sleep(wait, cancel_check)
 
+    if log_cb:
+        log_cb(f"API call failed after {MAX_RETRIES} attempts "
+               f"({type(last_exc).__name__})")
     raise last_exc
 
 
@@ -189,12 +214,16 @@ def _interruptible_sleep(seconds: float, cancel_check=None):
 def _parse_response(response, video_title: str, segments: list[dict],
                     valid_idx: set | None = None, log_cb=None,
                     tag: str = "response") -> dict:
+    stop = getattr(response, "stop_reason", None)
     # claude-sonnet-5 runs adaptive thinking by default, so the text answer
     # is not necessarily the first content block
     raw = next((b.text for b in response.content if b.type == "text"), None)
     if raw is None:
+        blocks = [getattr(b, "type", "?") for b in response.content]
+        _dump_debug(f"no text block; stop_reason={stop}; blocks={blocks}", tag)
         if log_cb:
-            log_cb(f"Claude response ({tag}) contained no text block — using fallback notes")
+            log_cb(f"Claude response ({tag}) contained no text block "
+                   f"(stop_reason={stop}, blocks={blocks}) — using fallback notes")
         return _fallback_notes(video_title, segments)
     raw = raw.strip()
     _dump_debug(raw, tag)
@@ -205,8 +234,9 @@ def _parse_response(response, video_title: str, segments: list[dict],
         notes = json.loads(raw)
     except json.JSONDecodeError:
         if log_cb:
-            log_cb(f"Claude response ({tag}) was not valid JSON — using fallback "
-                   f"notes (raw saved to {_DEBUG_DIR})")
+            truncated = " (response truncated at max_tokens)" if stop == "max_tokens" else ""
+            log_cb(f"Claude response ({tag}) was not valid JSON{truncated} — using "
+                   f"fallback notes (raw saved to {_DEBUG_DIR})")
         return _fallback_notes(video_title, segments)
     notes = _normalize_screenshot_refs(notes, valid_idx, log_cb=log_cb, tag=tag)
     return _normalize_content_boxes(notes, valid_idx)

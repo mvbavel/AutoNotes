@@ -45,8 +45,8 @@ Cancellation is cooperative: the worker raises `PipelineCancelled` (`pipeline/_u
 | `FFMPEG` / `FFPROBE` | `transcriber.py`, `frame_extractor.py` | `/opt/homebrew/bin/ffmpeg` |
 | `YTDLP_CMD` | `_paths.ytdlp_command()` | dev: system `yt-dlp`; frozen app: `[sys.executable, "--yt-dlp"]` re-exec running the bundled `yt_dlp` package (dispatch at the top of `main.py`) |
 | `MODEL` | `note_generator.py` | `"claude-sonnet-5"` (env override: `AUTONOTES_MODEL`) |
-| `MAX_FRAMES` | `frame_extractor.py` | `40` (scored candidates kept after dedup) |
-| `MAX_SCREENSHOTS` | `note_generator.py` | `30` (sent to Claude) |
+| `MAX_FRAMES` / `MIN_FRAMES` | `frame_extractor.py` | `60` / `8` — budget is `duration / TARGET_SECONDS_PER_FRAME` (30 s) clamped between them, so short videos get 1 frame/30s and long ones degrade toward 1/min+ |
+| `MAX_SCREENSHOTS` | `note_generator.py` | `60` (sent to Claude; chunked mode splits 30 per call) |
 | `INTERVAL_SECONDS` | `frame_extractor.py` | `5` (frame sampling interval) |
 | `MIN_GAP_SECONDS` | `frame_extractor.py` | `25` (min spacing between selected frames) |
 | `EXTRACT_WIDTH` / `API_MAX_WIDTH` | `frame_extractor.py` | `1280` / `1000` (full res kept for DOCX / downscaled copy sent to Claude) |
