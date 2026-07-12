@@ -10,8 +10,10 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pipeline.frame_extractor import _select_top
-from pipeline.note_generator import _coerce_idx, _normalize_screenshot_refs
+from pipeline.frame_extractor import (MAX_FRAMES, MIN_FRAMES, _frame_budget,
+                                      _select_top)
+from pipeline.note_generator import (MAX_SCREENSHOTS, _coerce_idx,
+                                     _normalize_screenshot_refs)
 
 
 def _group(ts, score):
@@ -43,6 +45,23 @@ class TestSelectTop(unittest.TestCase):
         groups = [_group(500, 0.9), _group(100, 0.8), _group(300, 0.7)]
         top = _select_top(groups, max_frames=3, min_gap=25)
         self.assertEqual([g["timestamp"] for g in top], [100, 300, 500])
+
+
+class TestFrameBudget(unittest.TestCase):
+    def test_short_video_gets_one_per_30s(self):
+        self.assertEqual(_frame_budget(10 * 60), 20)   # 10 min -> 20 frames
+
+    def test_half_hour_hits_ceiling_exactly(self):
+        self.assertEqual(_frame_budget(30 * 60), 60)
+
+    def test_long_video_capped_to_one_per_minute_or_less(self):
+        self.assertEqual(_frame_budget(98 * 60), MAX_FRAMES)  # ~1 per 98s
+
+    def test_tiny_video_floor(self):
+        self.assertEqual(_frame_budget(60), MIN_FRAMES)
+
+    def test_all_selected_frames_reach_claude(self):
+        self.assertGreaterEqual(MAX_SCREENSHOTS, MAX_FRAMES)
 
 
 class TestCoerceIdx(unittest.TestCase):

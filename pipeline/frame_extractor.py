@@ -5,7 +5,9 @@ import numpy as np
 
 from pipeline._paths import FFMPEG, FFPROBE
 
-MAX_FRAMES = 40           # scored candidates kept after dedup
+MAX_FRAMES = 60                  # hard ceiling on selected frames
+MIN_FRAMES = 8                   # floor for very short videos
+TARGET_SECONDS_PER_FRAME = 30    # aim for one screenshot per 30s of video
 INTERVAL_SECONDS = 5      # frame sampling interval
 EXTRACT_WIDTH = 1280      # width frames are extracted at; DOCX embeds full res
 API_MAX_WIDTH = 1000      # downscaled copy sent to Claude (controls token cost)
@@ -52,7 +54,11 @@ def extract_frames(video_path: str, temp_dir: str, progress_cb=None,
     Extract candidate frames from the video, crop to a detected presentation
     screen where possible, collapse near-duplicate slides, score for
     slide-likeness (with a bonus near visual-cue transcript moments),
-    and return the top MAX_FRAMES sorted by timestamp.
+    and return the top frames sorted by timestamp. The selection budget
+    scales with recording length (one frame per TARGET_SECONDS_PER_FRAME,
+    clamped to [MIN_FRAMES, MAX_FRAMES]), so long recordings degrade toward
+    one frame per minute or less, and scene-poor videos naturally yield
+    fewer via dedup.
     Returns list of {timestamp, path, api_path, score, cropped}: "path" is
     the full-resolution image (embedded in the DOCX), "api_path" a copy
     downscaled to API_MAX_WIDTH (sent to Claude).
@@ -110,7 +116,7 @@ def extract_frames(video_path: str, temp_dir: str, progress_cb=None,
         if progress_cb:
             progress_cb(60 + int((i + 1) / len(frame_files) * 35))
 
-    top = _select_top(groups, MAX_FRAMES, MIN_GAP_SECONDS)
+    top = _select_top(groups, _frame_budget(duration), MIN_GAP_SECONDS)
 
     for frame in top:
         # ffmpeg's mjpeg output lacks the JFIF/Exif marker python-docx
@@ -271,6 +277,11 @@ def _order_corners(quad):
         quad[np.argmax(sums)],   # bottom-right: largest x+y
         quad[np.argmax(diffs)],  # bottom-left: largest y-x
     ], dtype=np.float32)
+
+
+def _frame_budget(duration: float) -> int:
+    """Screenshot budget for a recording of the given length in seconds."""
+    return int(min(MAX_FRAMES, max(MIN_FRAMES, duration / TARGET_SECONDS_PER_FRAME)))
 
 
 def _select_top(groups: list[dict], max_frames: int, min_gap: float) -> list[dict]:
