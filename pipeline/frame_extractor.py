@@ -1,3 +1,4 @@
+import math
 import os
 import json
 import subprocess
@@ -9,7 +10,7 @@ MAX_FRAMES = 60                  # hard ceiling on selected frames
 MIN_FRAMES = 8                   # floor for very short videos
 TARGET_SECONDS_PER_FRAME = 30    # aim for one screenshot per 30s of video
 INTERVAL_SECONDS = 5      # frame sampling interval
-EXTRACT_WIDTH = 1280      # width frames are extracted at; DOCX embeds full res
+EXTRACT_WIDTH = 1920      # max width frames are extracted at (never upscaled); DOCX embeds full res
 API_MAX_WIDTH = 1000      # downscaled copy sent to Claude (controls token cost)
 
 # Fraction of significantly-changed pixels (256x144 grayscale, per-pixel
@@ -45,6 +46,12 @@ _CUE_PHRASES = (
 # Bonus when the frame was cropped to a detected physical screen — a screen
 # being shown is itself evidence the frame matters, whatever it displays
 _CROP_BONUS = 0.05
+
+# If every edge of the detected quad is within this many degrees of its
+# axis, the content is already upright (screen share / screencast) and a
+# plain bounding-box crop is used instead of a perspective warp — warping
+# to slightly-imprecise corners rotates flat content by the corner error.
+_MAX_AXIS_TILT_DEG = 2.5
 
 
 def extract_frames(video_path: str, temp_dir: str, progress_cb=None,
@@ -152,7 +159,8 @@ def _extract_all_frames(video_path: str, frames_dir: str, duration: float,
     pattern = os.path.join(frames_dir, "frame_%06d.jpg")
     cmd = [
         FFMPEG, "-y", "-i", video_path,
-        "-vf", f"fps=1/{INTERVAL_SECONDS},scale={EXTRACT_WIDTH}:-2",
+        # min() caps at EXTRACT_WIDTH without upscaling lower-res sources
+        "-vf", f"fps=1/{INTERVAL_SECONDS},scale=min(iw\\,{EXTRACT_WIDTH}):-2",
         "-q:v", "2",
         "-progress", "pipe:1", "-nostats", "-loglevel", "error",
         pattern,
@@ -252,19 +260,48 @@ def _detect_screen_quad(cv2, img):
 
 
 def _warp_crop(cv2, img, quad):
-    """Perspective-correct the quad to an upright rectangle."""
+    """Crop the quad: plain bounding-box crop when it's already upright,
+    perspective-correction only for genuinely skewed (filmed) screens."""
     ordered = _order_corners(quad)
     (tl, tr, br, bl) = ordered
     width = int(max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl)))
     height = int(max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr)))
     if width < 200 or height < 150:
         return None
+
+    if _max_edge_tilt_deg(ordered) <= _MAX_AXIS_TILT_DEG:
+        # Near-axis-aligned: pixel-exact crop, no rotation, no resampling
+        h, w = img.shape[:2]
+        x0 = max(0, int(math.floor(min(tl[0], bl[0]))))
+        y0 = max(0, int(math.floor(min(tl[1], tr[1]))))
+        x1 = min(w, int(math.ceil(max(tr[0], br[0]))))
+        y1 = min(h, int(math.ceil(max(br[1], bl[1]))))
+        if x1 - x0 < 200 or y1 - y0 < 150:
+            return None
+        return img[y0:y1, x0:x1]
+
     dst = np.array(
         [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
         dtype=np.float32,
     )
     matrix = cv2.getPerspectiveTransform(ordered, dst)
     return cv2.warpPerspective(img, matrix, (width, height))
+
+
+def _max_edge_tilt_deg(ordered) -> float:
+    """Largest deviation of the quad's edges from their nearest axis."""
+    (tl, tr, br, bl) = ordered
+
+    def from_horizontal(a, b):
+        ang = abs(math.degrees(math.atan2(b[1] - a[1], b[0] - a[0])))
+        return min(ang, 180.0 - ang)
+
+    def from_vertical(a, b):
+        ang = abs(math.degrees(math.atan2(b[1] - a[1], b[0] - a[0])))
+        return abs(ang - 90.0)
+
+    return max(from_horizontal(tl, tr), from_horizontal(bl, br),
+               from_vertical(tl, bl), from_vertical(tr, br))
 
 
 def _order_corners(quad):
