@@ -73,6 +73,7 @@ class ProcessingWorker(QThread):
         pre_segments = None   # transcript segments from download (VTT/SRT/Graph)
 
         if is_url and is_teams_url(self.input_source):
+            source_type = "Teams / SharePoint"
             self._log("Detected Teams/SharePoint URL — downloading recording…")
             teams = download_teams_recording(
                 self.input_source, temp_dir,
@@ -109,6 +110,7 @@ class ProcessingWorker(QThread):
                 self._log("MS Client ID set but no Join URL provided — skipping Graph API")
 
         elif is_url:
+            source_type = "YouTube"
             self._log("Downloading from YouTube…")
             video_path, title, description, yt_chapters = download_youtube(
                 self.input_source, temp_dir,
@@ -119,9 +121,19 @@ class ProcessingWorker(QThread):
             if yt_chapters:
                 self._log(f"Found {len(yt_chapters)} YouTube chapters")
         else:
+            source_type = "Local file"
             video_path = self.input_source
             title = os.path.splitext(os.path.basename(video_path))[0]
             self._progress(100)
+
+        # Recording metadata shown at the top of the document. The summary
+        # prefers the Teams AI recap (when Graph is configured) over the
+        # video/meeting description.
+        source_info = {
+            "type": source_type,
+            "url": self.input_source,
+            "summary": (ai_notes or description or "").strip(),
+        }
 
         self._log(f"Video: {title}")
         safe_title = safe_filename(title)
@@ -242,7 +254,8 @@ class ProcessingWorker(QThread):
         self._stage(7, total)
         self._log("Writing document…")
         output_dir = self.config.get("output_dir", os.path.expanduser("~/Desktop"))
-        out_path = write_docx(notes, frames, output_dir, safe_title, log_cb=self._log)
+        out_path = write_docx(notes, frames, output_dir, safe_title,
+                              log_cb=self._log, source_info=source_info)
         self._progress(100)
         self._log(f"Saved: {out_path}")
 

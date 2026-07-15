@@ -1,6 +1,7 @@
 import os
 import re
 from docx import Document
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
@@ -8,12 +9,13 @@ from docx.oxml import OxmlElement
 
 
 def write_docx(notes: dict, frames: list[dict], output_dir: str, safe_title: str,
-               log_cb=None) -> str:
+               log_cb=None, source_info: dict | None = None) -> str:
     """Build the DOCX from structured notes and return the output file path."""
     doc = Document()
     _setup_styles(doc)
 
     _add_title(doc, notes.get("title", safe_title))
+    _add_source_block(doc, source_info)
 
     frames_by_idx = {i + 1: f["path"] for i, f in enumerate(frames)}
     boxes = notes.get("screenshot_boxes") or {}
@@ -39,6 +41,70 @@ def _add_title(doc: Document, title: str):
     run = p.runs[0]
     run.font.size = Pt(24)
     doc.add_paragraph()
+
+
+def _add_source_block(doc: Document, source_info: dict | None):
+    """Recording metadata at the top of the document: type, URL/path, and
+    the recording summary (YouTube description / Teams AI recap) if any."""
+    if not source_info:
+        return
+
+    rec_type = (source_info.get("type") or "").strip()
+    url = (source_info.get("url") or "").strip()
+    summary = (source_info.get("summary") or "").strip()
+
+    if rec_type:
+        p = doc.add_paragraph()
+        p.add_run("Source: ").bold = True
+        p.add_run(rec_type)
+
+    if url:
+        p = doc.add_paragraph()
+        p.add_run("Recording: ").bold = True
+        if url.startswith(("http://", "https://")):
+            _add_hyperlink(p, url, url)
+        else:
+            p.add_run(url)
+
+    if summary:
+        p = doc.add_paragraph()
+        p.add_run("Recording summary:").bold = True
+        blank = False
+        for line in summary.splitlines():
+            line = line.rstrip()
+            if not line:
+                blank = True   # collapse runs of blank lines to one break
+                continue
+            sp = doc.add_paragraph()
+            if blank:
+                sp.paragraph_format.space_before = Pt(6)
+                blank = False
+            run = sp.add_run(line)
+            run.font.size = Pt(10)
+            run.font.color.rgb = RGBColor(0x44, 0x44, 0x44)
+
+    doc.add_paragraph()
+
+
+def _add_hyperlink(paragraph, url: str, text: str):
+    """Insert a clickable external hyperlink (python-docx has no API for this)."""
+    r_id = paragraph.part.relate_to(url, RT.HYPERLINK, is_external=True)
+    link = OxmlElement("w:hyperlink")
+    link.set(qn("r:id"), r_id)
+    run = OxmlElement("w:r")
+    rpr = OxmlElement("w:rPr")
+    color = OxmlElement("w:color")
+    color.set(qn("w:val"), "1155CC")
+    rpr.append(color)
+    underline = OxmlElement("w:u")
+    underline.set(qn("w:val"), "single")
+    rpr.append(underline)
+    run.append(rpr)
+    text_el = OxmlElement("w:t")
+    text_el.text = text
+    run.append(text_el)
+    link.append(run)
+    paragraph._p.append(link)
 
 
 def _add_chapter(doc: Document, chapter: dict, frames_by_idx: dict,
