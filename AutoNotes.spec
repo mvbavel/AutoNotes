@@ -37,10 +37,13 @@ _httpcore_datas, _httpcore_binaries, _httpcore_hidden = collect_all('httpcore')
 # Python environment the target machine won't have). Cryptodome is needed
 # for --cookies-from-browser chrome cookie decryption on macOS.
 _ytdlp_datas, _ytdlp_binaries, _ytdlp_hidden = collect_all('yt_dlp')
-_crypto_datas, _crypto_binaries, _crypto_hidden = collect_all('Cryptodome')
-_ytdlp_datas += _crypto_datas
-_ytdlp_binaries += _crypto_binaries
-_ytdlp_hidden += _crypto_hidden
+for _pkg in ('Cryptodome', 'curl_cffi'):
+    # Cryptodome: cookie decryption; curl_cffi: TLS impersonation, without
+    # which YouTube only serves the 360p legacy format
+    _d, _b, _h = collect_all(_pkg)
+    _ytdlp_datas += _d
+    _ytdlp_binaries += _b
+    _ytdlp_hidden += _h
 
 # ── Torch submodules (hooks-contrib handles core; we add explicit hidden) ─────
 _torch_hidden = collect_submodules('torch')

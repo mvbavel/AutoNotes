@@ -145,8 +145,8 @@ def _run_download(url: str, out_template: str, ffmpeg_dir: str, browser: str,
         *YTDLP_CMD,
         "--cookies-from-browser", browser,
         "--no-playlist",
-        "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-        "--merge-output-format", "mp4",
+        "--format", "bestvideo+bestaudio/best",
+        "--merge-output-format", "mp4/mkv",
         "--ffmpeg-location", ffmpeg_dir,
         # Keep subtitles in VTT where possible — Teams VTT carries speaker tags
         # that parse_vtt() needs; converting to SRT would destroy them

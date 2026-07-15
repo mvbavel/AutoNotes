@@ -12,14 +12,11 @@ YTDLP_CMD = ytdlp_command()
 
 _METADATA_TIMEOUT = 60  # seconds for the yt-dlp metadata fetch
 
-_UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+# No client pinning or UA spoofing: yt-dlp's maintained defaults pick working
+# player clients (a pinned ios/android/web list left only the 360p legacy
+# format once YouTube gated those clients behind PO tokens/SABR), and with
+# curl_cffi installed it impersonates a browser TLS fingerprint automatically.
 _BASE_ARGS = [
-    "--user-agent", _UA,
-    "--extractor-args", "youtube:player_client=ios,android,web",
     "--no-playlist",
     "--retries", "5",
     "--fragment-retries", "5",
@@ -40,19 +37,17 @@ def download_youtube(
     chapters = info.get("chapters") or []
     safe_title = safe_filename(title)
     out_template = os.path.join(output_dir, f"{safe_title}.%(ext)s")
-    out_path = os.path.join(output_dir, f"{safe_title}.mp4")
 
     ffmpeg_dir = os.path.dirname(FFMPEG)
     dl_args = [
         *YTDLP_CMD,
         *_BASE_ARGS,
-        "--format", (
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
-            "/bestvideo+bestaudio"
-            "/best[ext=mp4]"
-            "/best"
-        ),
-        "--merge-output-format", "mp4",
+        # Highest resolution regardless of container: 1440p/4K on YouTube is
+        # VP9/AV1, which an mp4-first format string silently caps at 1080p.
+        # Merge prefers mp4, falls back to mkv for codecs mp4 can't carry —
+        # ffmpeg reads either downstream.
+        "--format", "bestvideo+bestaudio/best",
+        "--merge-output-format", "mp4/mkv",
         "--ffmpeg-location", ffmpeg_dir,
         # Fetch subtitles (manual preferred, auto-generated as fallback)
         "--write-sub",
@@ -94,7 +89,20 @@ def download_youtube(
     if proc.returncode != 0:
         raise RuntimeError(f"yt-dlp exited with code {proc.returncode}")
 
+    out_path = _find_output(output_dir, safe_title)
+    if out_path is None:
+        raise RuntimeError("Download finished but no video file was produced")
+
     return out_path, title, description, chapters
+
+
+def _find_output(output_dir: str, safe_title: str) -> str | None:
+    """Locate the downloaded video (container depends on the merged codecs)."""
+    for ext in ("mp4", "mkv", "webm", "mov"):
+        candidate = os.path.join(output_dir, f"{safe_title}.{ext}")
+        if os.path.exists(candidate):
+            return candidate
+    return None
 
 
 def find_transcript(output_dir: str) -> list[dict] | None:
