@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
+import os
 import sys
+
+# In the frozen app, the bundled Python links Homebrew's OpenSSL, whose
+# compiled-in default CA path (/opt/homebrew/etc/openssl@3/cert.pem) doesn't
+# exist on machines without Homebrew — so every HTTPS request fails with
+# CERTIFICATE_VERIFY_FAILED. Point OpenSSL at the bundled certifi CA bundle.
+# Must run before any ssl/network import and before the --yt-dlp dispatch so
+# the re-exec'd yt-dlp subprocess inherits it too.
+if getattr(sys, "frozen", False):
+    try:
+        import certifi
+        _ca = certifi.where()
+        if os.path.exists(_ca):
+            os.environ["SSL_CERT_FILE"] = _ca
+            os.environ["SSL_CERT_DIR"] = os.path.dirname(_ca)
+            os.environ.setdefault("REQUESTS_CA_BUNDLE", _ca)
+    except Exception:
+        pass
 
 # Frozen-app dispatch: the pipeline invokes yt-dlp by re-running this same
 # executable with --yt-dlp, so the bundled yt_dlp package works on machines

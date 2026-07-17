@@ -31,6 +31,13 @@ _cv2_datas, _cv2_binaries, _cv2_hidden = collect_all('cv2')
 _anth_datas, _anth_binaries, _anth_hidden = collect_all('anthropic')
 _httpx_datas, _httpx_binaries, _httpx_hidden = collect_all('httpx')
 _httpcore_datas, _httpcore_binaries, _httpcore_hidden = collect_all('httpcore')
+# certifi CA bundle — main.py points OpenSSL at this so HTTPS works on Macs
+# without Homebrew's OpenSSL cert path; collect explicitly, don't rely on it
+# arriving as a transitive dependency
+_certifi_datas, _certifi_binaries, _certifi_hidden = collect_all('certifi')
+_httpx_datas += _certifi_datas
+_httpx_binaries += _certifi_binaries
+_httpx_hidden += _certifi_hidden
 
 # ── yt-dlp: bundled as a Python package, invoked via `AutoNotes --yt-dlp`
 # (the Homebrew /opt/homebrew/bin/yt-dlp file is only a shim that needs a
