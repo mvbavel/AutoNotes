@@ -15,6 +15,14 @@ from ui.secure_store import load_secret, save_secret
 from version import __version__
 
 
+def _elide_middle(text: str, head: int = 15, tail: int = 10) -> str:
+    """Shorten a long string to 'first head…last tail' so the info label
+    doesn't force the config panel wide. Short strings are left as-is."""
+    if len(text) <= head + tail + 1:
+        return text
+    return f"{text[:head]}…{text[-tail:]}"
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -389,14 +397,17 @@ class MainWindow(QMainWindow):
         if segments:
             src = meta.get("video", "")
             saved = meta.get("saved", "").replace("T", " ")
-            detail = f"'{src}', " if src else ""
+            detail = f"'{_elide_middle(src)}', " if src else ""
             when = f", saved {saved}" if saved else ""
             self.reuse_transcript_check.setEnabled(True)
             self.reuse_info_label.setText(
                 f"Available: {detail}{len(segments)} segments{when}")
+            # Full title on hover, since the display is elided
+            self.reuse_info_label.setToolTip(src)
         else:
             self.reuse_transcript_check.setEnabled(False)
             self.reuse_transcript_check.setChecked(False)
+            self.reuse_info_label.setToolTip("")
             self.reuse_info_label.setText(
                 "No saved transcript yet — one is kept after each transcription")
 
