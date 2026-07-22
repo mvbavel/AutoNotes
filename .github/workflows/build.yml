@@ -16,13 +16,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.9
+      # Must match the local build environment: the codebase uses PEP 604
+      # union syntax and several dependencies require Python >= 3.10
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: '3.14'
 
+      # ffmpeg/ffprobe are bundled into the .app by AutoNotes.spec.
+      # yt-dlp is NOT needed here — it ships as a bundled Python package.
       - name: Install Homebrew dependencies
-        run: brew install ffmpeg yt-dlp
+        run: brew install ffmpeg
 
       # Cache the pip download cache and installed packages to speed up re-runs
       - name: Cache pip
@@ -36,6 +40,9 @@ jobs:
         run: |
           pip3 install -r requirements.txt
           pip3 install pyinstaller
+
+      - name: Run tests
+        run: python3 -m unittest discover tests -v
 
       # PyInstaller caches bytecode in __pycache__; the Analysis cache lives in build/
       - name: Cache PyInstaller build
