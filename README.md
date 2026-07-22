@@ -1,5 +1,170 @@
 Convert a mpeg file or youtube video URL into a word document with summarised notes screen-shots associated to the notes, and organised into chapters as a summary of the video
 
+## Installation
+
+Download `AutoNotes.dmg` from the
+[latest release](https://github.com/mvbavel/AutoNotes/releases/latest), open
+it, and drag AutoNotes onto the Applications shortcut.
+
+Because the app is ad-hoc signed rather than notarised, the first launch must
+be **right-click (or Control-click) → Open → Open**. Subsequent launches work
+normally.
+
+> Always install by dragging from the DMG. Copying the app with `cp -r`, or
+> through tools that don't preserve symbolic links, breaks the bundled Qt
+> framework layout and the app will crash at launch.
+
+Everything AutoNotes needs — FFmpeg, yt-dlp, Python — is bundled. Nothing has
+to be installed separately.
+
+## Quick start
+
+1. **Launch AutoNotes.**
+2. **Choose a source** — paste a YouTube, Teams or SharePoint URL into the
+   *Video Input* box, or click **Browse…** to pick a local file
+   (`.mp4`, `.mpeg`, `.mpg`, `.mov`, `.avi`, `.mkv`).
+3. **Paste your Claude API key** (see below). This is the only mandatory
+   credential.
+4. *(Optional)* add a Hugging Face token for speaker names, pick a Whisper
+   model size, and set an output folder.
+5. **Click Generate Notes** and watch the log pane on the right.
+6. When it finishes, click **Open Document**.
+
+The result is saved as `<video title>_notes.docx` in your output folder
+(**`~/Desktop`** by default) and contains: the recording source and summary,
+AI-generated chapters, bullet-point notes with key terms in bold, speaker
+attribution, and screenshots cropped to the shared screen content.
+
+Settings persist between launches, so steps 3–4 are usually one-time.
+
+### What happens during a run
+
+The seven stages shown in the progress panel are:
+
+1. **Download / load video** — fetches the URL or opens the local file.
+2. **Extract audio** — 16 kHz mono WAV via FFmpeg (skipped if a transcript
+   already exists).
+3. **Transcribe speech** — Whisper, running locally on your CPU.
+4. **Identify speakers** — optional, needs a Hugging Face token.
+5. **Extract screenshots** — samples frames, detects shared screens, discards
+   duplicates and scores what's worth keeping.
+6. **Generate AI notes** — sends the transcript and screenshots to Claude.
+7. **Write document** — builds the `.docx`.
+
+Transcription (stage 3) dominates the runtime — roughly as long as the
+recording itself with the `medium` model, longer with `large-v3`. The log
+shows an estimate up front and progress with a live ETA every 10%. YouTube
+videos with subtitles and Teams recordings with transcripts skip stages 2–4
+entirely and finish in minutes.
+
+## Credentials
+
+### Claude API key — required
+
+Used to turn the transcript and screenshots into structured notes.
+
+1. Sign in at [console.anthropic.com](https://console.anthropic.com).
+2. Add billing credit — this is a paid API, separate from any Claude.ai
+   subscription.
+3. Create a key under **API Keys** and copy it (it starts with `sk-ant-`).
+4. Paste it into **Claude API Key** in AutoNotes.
+
+Cost depends on recording length and screenshot count, but is typically a
+few tens of US cents per hour of video. Usage is visible in the Console.
+
+### Hugging Face token — optional
+
+Enables **speaker diarization**: labelling who spoke when, so the notes say
+"Speaker A", "Speaker B" rather than a single generic "Speaker". Without it
+everything still works — you just lose per-speaker attribution.
+
+It is only used for locally transcribed audio. Teams recordings and
+downloaded transcripts already carry real speaker names, so the token is
+never needed for those.
+
+A **read-only** token is sufficient; AutoNotes only downloads models and
+never uploads anything.
+
+1. Create an account at [huggingface.co](https://huggingface.co).
+2. Under **Settings → Access Tokens**, create a token with the **Read** role.
+   (For a fine-grained token, grant *Read access to contents of all public
+   gated repos you can access*.)
+3. Signed in with that same account, open
+   [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
+   and [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
+   and **accept the user conditions** on each. These are free but gated
+   models — the token alone is not enough.
+4. Paste the token (it starts with `hf_`) into **HuggingFace Token**.
+
+If the token is valid but the conditions haven't been accepted, the run
+continues without speaker labels and the log explains why.
+
+### How credentials are stored
+
+Both are held in the **macOS Keychain** (service name `AutoNotes`), not in a
+plain-text file. Any older plain-text values are migrated automatically on
+first launch.
+
+## Whisper model sizes
+
+`tiny` · `base` · `small` · `medium` (default) · `large-v3`
+
+Larger models are more accurate and considerably slower on CPU — `large-v3`
+takes roughly 2–3× as long as `medium`. The first use of any size downloads
+it (a one-time download of up to ~1.5 GB, cached in
+`~/.cache/huggingface/hub/`); the log says so before it starts.
+
+## Reuse last transcript
+
+Transcription is by far the slowest stage, so after every successful
+transcription AutoNotes saves the result to
+`~/Library/Logs/AutoNotes/last_transcript.json`.
+
+Tick **Reuse last transcript (skip transcription)** to load that saved
+transcript instead of transcribing again. Stages 2–4 are skipped and the run
+completes in minutes rather than hours.
+
+This is useful when you want to re-generate a document without paying the
+transcription cost again — for example after changing the output folder, or
+to pick up an improved version of the app.
+
+- The checkbox is **only enabled when a saved transcript exists**, and the
+  line beneath it shows which recording it came from, how many segments it
+  has, and when it was saved.
+- Only the **most recent** transcript is kept; each successful run overwrites
+  it.
+- If the saved transcript came from a *different* recording than the one you
+  are processing, the run continues but the log prints a clear warning — the
+  notes would otherwise describe the wrong video.
+- The box is unticked at every launch, so a stale transcript is never used by
+  accident.
+- A transcript that ships with the recording (a Teams or YouTube transcript)
+  always takes priority over the saved one.
+
+## Where files are stored
+
+| Location | Contents |
+|---|---|
+| `~/Desktop` (configurable) | The generated `<title>_notes.docx` |
+| `~/Library/Logs/AutoNotes/autonotes.log` | Running log of every run, including full error tracebacks. **Start here when something fails.** |
+| `~/Library/Logs/AutoNotes/last_transcript.json` | Saved transcript used by *Reuse last transcript* |
+| `~/Library/Logs/AutoNotes/last_run_frames/` | Copies of the screenshots selected in the last run, named by timestamp — handy for checking what the app chose |
+| `~/Library/Logs/AutoNotes/last_claude_*.json` | Raw responses from Claude for the last run, for diagnosing note or screenshot problems |
+| `~/.cache/huggingface/hub/` | Downloaded Whisper and diarization models (largest disk user; safe to delete, models re-download on demand) |
+| macOS Keychain (service `AutoNotes`) | Claude API key and Hugging Face token |
+| `~/Library/Preferences/com.autonotes.AutoNotes.plist` | Non-secret settings: model size, output folder, Teams client ID and join URL |
+| `~/.autonotes_graph_tokens.json` | Microsoft Graph sign-in token cache, owner-readable only (only if Teams Graph integration is used) |
+
+**Temporary working files** — the downloaded video, extracted audio, and all
+sampled frames — go to a private folder under the system temporary directory
+(`/var/folders/…/autonotes_*`) and are **deleted automatically when the run
+ends**, including after an error or cancellation. These can be many gigabytes
+while a run is in progress, so keep some free disk space available.
+
+Nothing in `~/Library/Logs/AutoNotes/` is required for the app to work; you
+can delete the whole folder at any time. Note that doing so removes the saved
+transcript, disabling *Reuse last transcript* until the next run.
+
 ## Using a Microsoft Teams recording
 
 There are two ways to process a Teams meeting recording. **Option A needs no
