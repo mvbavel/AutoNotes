@@ -11,3 +11,7 @@ yt-dlp[default,curl-cffi]>=2026.7.4
 msal>=1.28.0
 requests>=2.31.0
 keyring>=25.0.0
+# Verify TLS via the macOS trust store: Python 3.13+ VERIFY_X509_STRICT rejects
+# TLS-inspection roots (Zscaler) whose basicConstraints isn't marked critical,
+# so a merged CA bundle alone can't authenticate an inspected network.
+truststore>=0.10.0
