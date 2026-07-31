@@ -86,7 +86,9 @@ class ProcessingWorker(QThread):
             description = teams["description"]
             pre_segments = teams["transcript_segments"]
 
-            # Fetch Graph API metadata if client ID is configured
+            # Fetch Graph API metadata if client ID is configured. Transcripts
+            # come from the recording itself (sharepoint_transcript.py), so
+            # Graph is only consulted for attendees, the AI recap and the title.
             ms_client_id = self.config.get("ms_client_id", "").strip()
             join_url = self.config.get("ms_join_url", "").strip()
             if ms_client_id and join_url:
@@ -94,16 +96,6 @@ class ProcessingWorker(QThread):
                 ctx = fetch_meeting_context(ms_client_id, join_url, log_cb=self._log)
                 attendees = ctx["attendees"]
                 ai_notes = ctx["ai_notes"]
-                # Graph transcript takes priority over yt-dlp VTT
-                if ctx["transcript_vtt"]:
-                    from pipeline.vtt_parser import parse_vtt
-                    tmp_vtt = os.path.join(temp_dir, "graph_transcript.vtt")
-                    with open(tmp_vtt, "w", encoding="utf-8") as f:
-                        f.write(ctx["transcript_vtt"])
-                    parsed = parse_vtt(tmp_vtt)
-                    if parsed:
-                        pre_segments = parsed
-                        self._log(f"Using Graph API transcript ({len(pre_segments)} segments)")
                 if ctx["title"]:
                     title = ctx["title"]
             elif ms_client_id and not join_url:
