@@ -52,21 +52,24 @@ class TestBuildCaBundle(unittest.TestCase):
         """The Zscaler case: a keychain-only root must end up in the bundle."""
         self._fake_keychain(CORP)
         path = _certs.build_ca_bundle(self.certifi_pem, self.dest, force=True)
-        blocks = _certs._pem_blocks(open(path).read())
+        with open(path) as f:
+            blocks = _certs._pem_blocks(f.read())
         self.assertIn(CORP, blocks)
         self.assertIn(CERT_A, blocks)   # certifi roots retained
 
     def test_duplicates_collapsed(self):
         self._fake_keychain(CERT_A)     # keychain repeats a certifi root
         path = _certs.build_ca_bundle(self.certifi_pem, self.dest, force=True)
-        blocks = _certs._pem_blocks(open(path).read())
+        with open(path) as f:
+            blocks = _certs._pem_blocks(f.read())
         self.assertEqual(blocks.count(CERT_A), 1)
         self.assertEqual(len(blocks), 2)
 
     def test_keychain_unavailable_still_yields_certifi(self):
         self._fake_keychain("")         # e.g. `security` missing or denied
         path = _certs.build_ca_bundle(self.certifi_pem, self.dest, force=True)
-        self.assertEqual(_certs._pem_blocks(open(path).read()), [CERT_A, CERT_B])
+        with open(path) as f:
+            self.assertEqual(_certs._pem_blocks(f.read()), [CERT_A, CERT_B])
 
     def test_missing_certifi_returns_none(self):
         self._fake_keychain(CORP)

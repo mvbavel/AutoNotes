@@ -84,7 +84,8 @@ class TestAppliedAtStartup(unittest.TestCase):
                         f"dev-mode startup did not configure trust: {out.stdout!r}")
 
     def test_not_gated_on_frozen(self):
-        src = open(os.path.join(REPO, "main.py"), encoding="utf-8").read()
+        with open(os.path.join(REPO, "main.py"), encoding="utf-8") as f:
+            src = f.read()
         # Anchor on the dispatch statement itself, not the word in a comment.
         head = src[:src.index('sys.argv[1] == "--yt-dlp"')]
         self.assertIn("configure_trust", head,
