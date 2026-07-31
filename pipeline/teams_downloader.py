@@ -7,6 +7,7 @@ import subprocess
 
 from pipeline._paths import FFMPEG, ytdlp_command
 from pipeline._util import safe_filename
+from pipeline.sharepoint_transcript import fetch_transcript
 from pipeline.vtt_parser import parse_srt, parse_vtt
 
 YTDLP_CMD = ytdlp_command()
@@ -211,6 +212,16 @@ def download_teams_recording(
         if log_cb:
             log_cb("Parsing SRT transcript…")
         result["transcript_segments"] = parse_srt(srt_files[0])
+
+    # yt-dlp's SharePoint extractor exposes no subtitles at all, so the VTT
+    # branches above never fire for stream.aspx URLs — ask the Stream API
+    # directly for the Teams transcript instead.
+    if not result["transcript_segments"]:
+        if log_cb:
+            log_cb("Checking for a Teams transcript…")
+        result["transcript_segments"] = fetch_transcript(
+            url, browsers=_BROWSERS, log_cb=log_cb
+        )
 
     if progress_cb:
         progress_cb(100)
