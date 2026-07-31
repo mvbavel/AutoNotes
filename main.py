@@ -20,19 +20,24 @@
 import os
 import sys
 
-# In the frozen app, the bundled Python links Homebrew's OpenSSL, whose
-# compiled-in default CA path (/opt/homebrew/etc/openssl@3/cert.pem) doesn't
-# exist on machines without Homebrew — so every HTTPS request fails with
-# CERTIFICATE_VERIFY_FAILED. Trust the bundled certifi roots *and* the macOS
-# system keychain, so TLS-inspecting proxies (Zscaler et al.) whose corporate
-# root is keychain-only also verify. Must run before any ssl/network import
-# and before the --yt-dlp dispatch, so the re-exec'd subprocess inherits it.
-if getattr(sys, "frozen", False):
-    try:
-        from pipeline._certs import configure_ssl_env
-        configure_ssl_env()
-    except Exception:
-        pass
+# Configure TLS trust before any ssl/network import and before the --yt-dlp
+# dispatch, so the re-exec'd yt-dlp inherits it too.
+#
+# Two problems this solves. The frozen app's bundled Python links Homebrew's
+# OpenSSL, whose compiled-in CA path doesn't exist on machines without
+# Homebrew. And on a TLS-inspecting network (Zscaler et al.) the proxy re-signs
+# every connection with a corporate root that is keychain-only, which Python
+# 3.13+ then rejects under VERIFY_X509_STRICT because it isn't RFC-compliant —
+# so macOS-native verification, not just a merged CA bundle, is required.
+#
+# Runs unconditionally: running from source hits the inspected-network case
+# exactly as the frozen app does, and gating this on sys.frozen silently broke
+# every download outside the built .app.
+try:
+    from pipeline._certs import configure_trust
+    configure_trust()
+except Exception:
+    pass
 
 # Frozen-app dispatch: the pipeline invokes yt-dlp by re-running this same
 # executable with --yt-dlp, so the bundled yt_dlp package works on machines

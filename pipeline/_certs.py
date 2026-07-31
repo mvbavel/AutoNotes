@@ -132,3 +132,38 @@ def configure_ssl_env() -> str | None:
     os.environ["REQUESTS_CA_BUNDLE"] = ca
     os.environ["CURL_CA_BUNDLE"] = ca   # libcurl backend used by curl_cffi
     return ca
+
+
+def use_native_trust() -> bool:
+    """Verify TLS through the macOS trust store instead of OpenSSL's rules.
+
+    A merged CA bundle is not enough on an inspected network. Python 3.13+
+    turns on VERIFY_X509_STRICT by default, and Zscaler's root declares
+    basicConstraints without marking it critical — an RFC 5280 violation that
+    strict verification rejects outright ("Basic Constraints of CA cert not
+    marked critical"), even once the root is present. macOS accepts it, which
+    is why the same sites load in Safari. truststore routes verification
+    through that store, so corporate roots work without us having to weaken
+    verification for everyone else.
+    """
+    try:
+        import truststore
+        truststore.inject_into_ssl()
+        return True
+    except Exception:
+        return False
+
+
+def configure_trust() -> dict:
+    """Set up TLS for both in-process clients and child processes.
+
+    Returns {"native_trust": bool, "ca_bundle": str | None} so callers can log
+    what actually took effect.
+    """
+    native = use_native_trust()
+    # Still needed even when native trust is active: truststore only patches
+    # this process's ssl module, while yt-dlp runs as a child process and
+    # curl_cffi's libcurl backend never touches Python's ssl at all. Both read
+    # these variables.
+    ca = configure_ssl_env()
+    return {"native_trust": native, "ca_bundle": ca}

@@ -1,5 +1,8 @@
 build/
 dist/
+.venv/
+# Machine-local Claude Code permissions (absolute paths, per-machine)
+.claude/settings.local.json
 __pycache__/
 *.pyc
 *.pyo

@@ -4,12 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Running the app
 
+From the repo root:
+
 ```bash
-cd /Users/mvb/Code/AutoNotes
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt   # includes PyQt6
 python3 main.py
 ```
 
-PyQt6 is installed globally via `pip3`. All other dependencies are in `requirements.txt` and should be installed with `pip3 install -r requirements.txt`.
+The venv is **required**, not a preference: Homebrew's Python is externally managed, so `pip3 install -r requirements.txt` aborts with `externally-managed-environment` (PEP 668), and `/opt/homebrew/bin/python3` has no PyQt6 of its own. `ffmpeg`/`ffprobe` must be on Homebrew (`/opt/homebrew/bin`), and the pipeline shells out to the *system* `yt-dlp` in dev mode — keep it at or above the `requirements.txt` floor with `brew upgrade yt-dlp`, since a stale one breaks the SharePoint extractor.
+
+Note `ps` shows the Homebrew `Python.app` binary even when running from the venv (macOS venvs exec the base framework stub for GUI support) — check `sys.prefix` to confirm which environment is live.
+
+To launch, screenshot or smoke-test the app without a display, use the `run-autonotes` skill (`.claude/skills/run-autonotes/`) rather than driving Qt by hand.
+
+Two setup paths deliberately differ from the above and should not be "fixed" to match it: `build.sh` targets `/opt/homebrew/bin/python3` and installs PyInstaller with `--break-system-packages`, so a PyInstaller build expects the dependencies importable by *that* interpreter, not the venv (untested against a venv). CI (`.github/workflows/build.yml`) uses a bare `pip3 install`, which is fine there because `actions/setup-python` provides an unmanaged interpreter.
 
 ## Architecture
 
