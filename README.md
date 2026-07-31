@@ -234,11 +234,12 @@ Administrator role.
    | `User.Read` | Sign-in and basic profile | Not required |
    | `Calendars.Read` | Find the meeting and its attendees | Not required |
    | `OnlineMeetings.Read` | Look up the meeting by join URL | **Required** |
-   | `OnlineMeetingTranscript.Read.All` | Read the meeting transcript | **Required** |
+
+   Transcripts do not appear here: AutoNotes reads them from the recording
+   itself, so `OnlineMeetingTranscript.Read.All` is no longer needed.
 
 4. **Grant admin consent** — click *Grant admin consent for &lt;tenant&gt;*.
-   Without this, sign-in will succeed but transcript and meeting lookups
-   return nothing.
+   Without this, sign-in will succeed but meeting lookups return nothing.
 5. **Share the Application (client) ID** with users — it is on the app's
    *Overview* page. It is not a secret.
 

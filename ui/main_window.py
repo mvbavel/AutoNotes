@@ -145,14 +145,14 @@ class MainWindow(QMainWindow):
         form.addRow("", teams_header)
 
         self.ms_client_id_edit = QLineEdit()
-        self.ms_client_id_edit.setPlaceholderText("Azure app Client ID (for attendees, AI notes, transcript)")
+        self.ms_client_id_edit.setPlaceholderText("Azure app Client ID (for attendees and AI notes)")
         form.addRow("MS Client ID:", self.ms_client_id_edit)
 
         self.ms_join_url_edit = QLineEdit()
         self.ms_join_url_edit.setPlaceholderText("Teams meeting Join URL (from calendar invite — enables full metadata)")
         form.addRow("Join URL:", self.ms_join_url_edit)
 
-        ms_hint = QLabel("Leave blank to use recording URL only (video + VTT transcript via yt-dlp)")
+        ms_hint = QLabel("Leave blank to use recording URL only (transcript still comes from the recording)")
         ms_hint.setStyleSheet("color: #888; font-size: 10px;")
         form.addRow("", ms_hint)
 

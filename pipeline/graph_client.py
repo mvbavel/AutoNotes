@@ -9,11 +9,13 @@ import re
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 AUTHORITY = "https://login.microsoftonline.com/common"
+# Transcripts are not fetched here — sharepoint_transcript.py gets them from the
+# recording itself with no app registration, so OnlineMeetingTranscript.Read.All
+# (which needs tenant-admin consent) is deliberately not requested.
 SCOPES = [
     "User.Read",
     "Calendars.Read",
     "OnlineMeetings.Read",
-    "OnlineMeetingTranscript.Read.All",
 ]
 _CACHE_PATH = os.path.expanduser("~/.autonotes_graph_tokens.json")
 
@@ -68,17 +70,6 @@ def _get(token: str, path: str, params: dict | None = None):
     return r.json()
 
 
-def _get_raw(token: str, path: str) -> bytes:
-    import requests
-    r = requests.get(
-        f"{GRAPH}{path}",
-        headers={"Authorization": f"Bearer {token}", "Accept": "text/vtt"},
-        timeout=60,
-    )
-    r.raise_for_status()
-    return r.content
-
-
 # ── Meeting lookup ─────────────────────────────────────────────────────────────
 
 def find_meeting(token: str, join_url: str, log_cb=None) -> dict | None:
@@ -119,22 +110,6 @@ def get_attendees_from_calendar(token: str, join_url: str, log_cb=None) -> list[
     return []
 
 
-def get_transcript_vtt(token: str, meeting_id: str, log_cb=None) -> str | None:
-    """Return the VTT content of the first transcript for a meeting, or None."""
-    try:
-        data = _get(token, f"/me/onlineMeetings/{meeting_id}/transcripts")
-        transcripts = data.get("value", [])
-        if not transcripts:
-            return None
-        tid = transcripts[0]["id"]
-        raw = _get_raw(token, f"/me/onlineMeetings/{meeting_id}/transcripts/{tid}/content")
-        return raw.decode("utf-8", errors="replace")
-    except Exception as e:
-        if log_cb:
-            log_cb(f"Transcript fetch failed: {e}")
-        return None
-
-
 def get_ai_notes(token: str, meeting_id: str, log_cb=None) -> str | None:
     """Return Teams AI-generated meeting recap text, or None if unavailable."""
     try:
@@ -152,10 +127,10 @@ def get_ai_notes(token: str, meeting_id: str, log_cb=None) -> str | None:
 def fetch_meeting_context(client_id: str, join_url: str, log_cb=None) -> dict:
     """Fetch all available meeting metadata from Graph API.
 
-    Returns a dict with keys: title, attendees, transcript_vtt, ai_notes.
+    Returns a dict with keys: title, attendees, ai_notes.
     Any unavailable field is None / [].
     """
-    ctx: dict = {"title": None, "attendees": [], "transcript_vtt": None, "ai_notes": None}
+    ctx: dict = {"title": None, "attendees": [], "ai_notes": None}
 
     try:
         token = get_token(client_id, log_cb=log_cb)
@@ -173,13 +148,6 @@ def fetch_meeting_context(client_id: str, join_url: str, log_cb=None) -> dict:
         meeting_id = meeting.get("id")
         if log_cb:
             log_cb(f"Meeting found: {ctx['title']}")
-
-        if log_cb:
-            log_cb("Fetching meeting transcript…")
-        ctx["transcript_vtt"] = get_transcript_vtt(token, meeting_id, log_cb=log_cb)
-        if ctx["transcript_vtt"]:
-            if log_cb:
-                log_cb("Transcript retrieved from Graph API")
 
         if log_cb:
             log_cb("Fetching AI notes…")
