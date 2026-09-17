@@ -5,7 +5,7 @@ import re
 import subprocess
 
 from pipeline._paths import FFMPEG, ytdlp_command
-from pipeline._util import safe_filename
+from pipeline._util import PipelineCancelled, safe_filename
 from pipeline.vtt_parser import parse_srt
 
 YTDLP_CMD = ytdlp_command()
@@ -49,11 +49,6 @@ def download_youtube(
         "--format", "bestvideo+bestaudio/best",
         "--merge-output-format", "mp4/mkv",
         "--ffmpeg-location", ffmpeg_dir,
-        # Fetch subtitles (manual preferred, auto-generated as fallback)
-        "--write-sub",
-        "--write-auto-sub",
-        "--sub-langs", "en.*",
-        "--convert-subs", "srt",
         "--newline",
         "--progress",
         "-o", out_template,
@@ -93,7 +88,82 @@ def download_youtube(
     if out_path is None:
         raise RuntimeError("Download finished but no video file was produced")
 
+    _download_subtitles(url, out_template, ffmpeg_dir, _pick_sub_lang(info), log_cb, cancel_check)
+
     return out_path, title, description, chapters
+
+
+def _pick_sub_lang(info: dict) -> str | None:
+    """Choose the single English track to fetch, manual captions preferred.
+
+    A glob like "en.*" also matches YouTube's auto-*translated* tracks
+    (en-es-…, en-pt-…, en-de-…), so yt-dlp would request six or seven files
+    back-to-back and trip a 429 — for a pipeline that only ever reads one.
+    """
+    for source in (info.get("subtitles"), info.get("automatic_captions")):
+        if not source:
+            continue
+        for preferred in ("en", "en-orig"):
+            if preferred in source:
+                return preferred
+        for lang in source:
+            if lang.startswith("en-"):
+                return lang
+    return None
+
+
+def _download_subtitles(
+    url: str, out_template: str, ffmpeg_dir: str, sub_lang: str | None,
+    log_cb=None, cancel_check=None,
+) -> None:
+    """Best-effort subtitle fetch, kept separate from the video download.
+
+    YouTube rate-limits (429) or otherwise fails the subtitle endpoint often
+    enough that yt-dlp would abort the whole run over it; a missing SRT just
+    means the pipeline transcribes with Whisper instead, so failures here are
+    logged and swallowed rather than raised.
+    """
+    if sub_lang is None:
+        if log_cb:
+            log_cb("No English subtitles listed; will transcribe with Whisper instead.")
+        return
+
+    sub_args = [
+        *YTDLP_CMD,
+        *_BASE_ARGS,
+        "--skip-download",
+        "--write-sub",
+        "--write-auto-sub",
+        "--sub-langs", sub_lang,
+        "--convert-subs", "srt",
+        # --convert-subs shells out to ffmpeg, which is not assumed on PATH.
+        "--ffmpeg-location", ffmpeg_dir,
+        "-o", out_template,
+        url,
+    ]
+    try:
+        proc = subprocess.Popen(
+            sub_args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            for _ in proc.stdout:
+                if cancel_check:
+                    cancel_check()
+            proc.wait()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        if proc.returncode != 0 and log_cb:
+            log_cb("Subtitle download failed; will transcribe with Whisper instead.")
+    except PipelineCancelled:
+        raise
+    except Exception:
+        if log_cb:
+            log_cb("Subtitle download failed; will transcribe with Whisper instead.")
 
 
 def _find_output(output_dir: str, safe_title: str) -> str | None:
