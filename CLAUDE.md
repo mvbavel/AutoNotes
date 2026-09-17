@@ -13,7 +13,9 @@ pip install -r requirements.txt   # includes PyQt6
 python3 main.py
 ```
 
-The venv is **required**, not a preference: Homebrew's Python is externally managed, so `pip3 install -r requirements.txt` aborts with `externally-managed-environment` (PEP 668), and `/opt/homebrew/bin/python3` has no PyQt6 of its own. `ffmpeg`/`ffprobe` must be on Homebrew (`/opt/homebrew/bin`), and the pipeline shells out to the *system* `yt-dlp` in dev mode — keep it at or above the `requirements.txt` floor with `brew upgrade yt-dlp`, since a stale one breaks the SharePoint extractor.
+The venv is **required**, not a preference: Homebrew's Python is externally managed, so `pip3 install -r requirements.txt` aborts with `externally-managed-environment` (PEP 668), and `/opt/homebrew/bin/python3` has no PyQt6 of its own. `ffmpeg`/`ffprobe` must be on Homebrew (`/opt/homebrew/bin`), and the pipeline invokes yt-dlp by re-execing `main.py --yt-dlp` in *both* dev and frozen mode, so the venv's `yt_dlp` package is what runs — `pip install -r requirements.txt` keeps it current, and the `/opt/homebrew/bin/yt-dlp` binary is no longer on the app's path at all. Keep it at or above the `requirements.txt` floor: a stale yt-dlp breaks the SharePoint extractor and gets every YouTube download 403'd (below `2026.8.19` it falls back to the `android_vr` client, whose CDN URLs YouTube now rejects).
+
+Note `/opt/homebrew/bin/yt-dlp` is a *pip* console script installed into Homebrew's Python, not the Homebrew formula — that pip package is what `AutoNotes.spec` bundles via `collect_all('yt_dlp')`, so `build.sh` needs it even though the app no longer shells out to it. Upgrade that one with `/opt/homebrew/bin/python3 -m pip install --break-system-packages --upgrade yt-dlp`; `brew upgrade yt-dlp` does nothing for it.
 
 Note `ps` shows the Homebrew `Python.app` binary even when running from the venv (macOS venvs exec the base framework stub for GUI support) — check `sys.prefix` to confirm which environment is live.
 

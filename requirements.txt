@@ -6,8 +6,10 @@ python-docx>=1.1.0
 Pillow>=10.0.0
 opencv-python-headless>=4.8.0
 # curl-cffi enables browser TLS impersonation — without it YouTube only
-# serves the 360p legacy format; keep yt-dlp current, extractors rot fast
-yt-dlp[default,curl-cffi]>=2026.7.4
+# serves the 360p legacy format; keep yt-dlp current, extractors rot fast.
+# 2026.8.19 is a hard floor: 2026.7.4 falls back to the android_vr client,
+# whose CDN URLs YouTube now 403s, so every download fails.
+yt-dlp[default,curl-cffi]>=2026.8.19
 msal>=1.28.0
 requests>=2.31.0
 keyring>=25.0.0

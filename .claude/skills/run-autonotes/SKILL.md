@@ -31,14 +31,28 @@ brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
 brew list yt-dlp >/dev/null 2>&1 || brew install yt-dlp
 ```
 
-`yt-dlp` does need to stay current: `requirements.txt` pins `>=2026.7.4` because
-extractors rot, and Homebrew's copy drifts below that floor and silently breaks
-the SharePoint extractor. Check before upgrading:
+`yt-dlp` does need to stay current: `requirements.txt` pins `>=2026.8.19`
+because extractors rot. A stale copy silently breaks the SharePoint extractor,
+and anything below `2026.8.19` falls back to the `android_vr` player client,
+whose CDN URLs YouTube now rejects — every YouTube download dies with
+`unable to download video data: HTTP Error 403: Forbidden`. Check it:
 
 ```bash
-/opt/homebrew/bin/yt-dlp --version   # must be >= 2026.07.04
-# if older:  brew upgrade yt-dlp
+/opt/homebrew/bin/yt-dlp --version   # must be >= 2026.08.19
 ```
+
+**`brew upgrade yt-dlp` does not fix this.** `/opt/homebrew/bin/yt-dlp` is a
+pip-installed console script that *shadows* the Homebrew formula's binary, so
+upgrading the formula changes nothing the app runs (brew even warns:
+`executables are shadowed by other commands earlier in your PATH`). Upgrade the
+pip copy that actually answers — the same interpreter `build.sh` bundles from:
+
+```bash
+/opt/homebrew/bin/python3 -m pip install --break-system-packages --upgrade yt-dlp
+```
+
+`yt-dlp -v` prints its own provenance (`from yt-dlp/yt-dlp [hash] (pip)`) if you
+need to confirm which install is winning.
 
 ## Setup
 
@@ -143,9 +157,24 @@ source .venv/bin/activate && python3 main.py
 - **`process_btn` stays disabled** with no API key (`_on_input_changed` requires
   input *and* key). Blanking secrets therefore disables it — pass `--api-key
   dummy`.
-- **Dev mode uses system `yt-dlp`, not the venv's.** `_paths.ytdlp_command()`
-  resolves it from `/opt/homebrew/bin`, so `pip install -U yt-dlp` inside the
-  venv changes nothing. Use `brew upgrade yt-dlp`.
+- **Dev mode runs the venv's `yt_dlp`, via `main.py --yt-dlp`.**
+  `_paths.ytdlp_command()` re-execs the app's own dispatch in both dev and
+  frozen mode, so the child inherits the TLS trust `main.py` installs. Do not
+  "simplify" it back to the `/opt/homebrew/bin/yt-dlp` binary: a bare binary
+  gets no truststore, so on a TLS-inspecting network (Zscaler) every download
+  dies with `CERTIFICATE_VERIFY_FAILED`. Upgrade with `pip install -U
+  'yt-dlp[default,curl-cffi]'` *inside the venv*.
+- **`build.sh` still needs the pip `yt_dlp` in Homebrew's Python**, separately
+  from the venv: `AutoNotes.spec` runs `collect_all('yt_dlp')` against that
+  interpreter. Upgrade that copy with `/opt/homebrew/bin/python3 -m pip install
+  --break-system-packages -U yt-dlp` — `brew upgrade yt-dlp` does not touch it
+  (`/opt/homebrew/bin/yt-dlp` is a pip console script, not the formula).
+- **Never `brew uninstall` a formula here without `--dry-run` first.** Homebrew
+  autoremoves the dependencies too: uninstalling the `yt-dlp` formula unlinked
+  `python@3.14`, removed `sqlite` (breaking `import sqlite3`, so
+  `--cookies-from-browser` and the whole Teams path) and deleted `certifi`'s
+  files. Recovery: `brew link --overwrite python@3.14`, `brew install sqlite`,
+  force-reinstall `certifi`, then check `brew missing`.
 - **SharePoint auth is Edge-only in practice.** `FedAuth`/`rtFa` are *persistent*
   cookies in Edge but *session* cookies in Chrome, and
   `--cookies-from-browser` reads the on-disk DB — so Chrome's copy is stale and
@@ -168,6 +197,8 @@ source .venv/bin/activate && python3 main.py
 | `error: externally-managed-environment` from `pip3 install` | Use the venv (see Setup). Don't reach for `--break-system-packages`. |
 | `ModuleNotFoundError: No module named 'PyQt6'` | The venv isn't active, or you're on bare `/opt/homebrew/bin/python3`, which has no PyQt6. |
 | `could not create image from display` | Screen Recording permission. Use `driver.py gui --screenshot`. |
-| `Session cookies are required for this URL … --cookies-from-browser will not work` | Open the recording in Edge and let it play, then retry. Also check `brew upgrade yt-dlp`. |
+| `Session cookies are required for this URL … --cookies-from-browser will not work` | Open the recording in Edge and let it play, then retry. Also check yt-dlp is current (see Prerequisites — pip, not brew). |
+| `unable to download video data: HTTP Error 403: Forbidden` on every YouTube URL | Stale yt-dlp falling back to the `android_vr` client. Upgrade to `>=2026.8.19` (see Prerequisites). |
+| `CERTIFICATE_VERIFY_FAILED … unable to get local issuer certificate` from yt-dlp | TLS-inspecting network (Zscaler). Its root fails `VERIFY_X509_STRICT` ("Basic Constraints … not marked critical"), and truststore only patches ssl *in-process* — so yt-dlp must be invoked via `main.py --yt-dlp`, never as a bare binary. Check `ytdlp_command()` still re-execs. |
 | `AttributeError: 'MainWindow' object has no attribute …` from the driver | UI attribute renamed; the driver reads `stage_labels`, `url_edit`, `process_btn`, `api_key_edit`, `model_combo`, `output_dir_edit`, `reuse_transcript_check`, `reuse_info_label`. |
 | `pipeline` reports fewer than 8 frames | Real signal, not driver flake — dedup/scoring in `frame_extractor.py` is over-collapsing. |
