@@ -5,6 +5,7 @@ import subprocess
 import numpy as np
 
 from pipeline._paths import FFMPEG, FFPROBE
+from pipeline.letterbox import trim_letterbox
 
 MAX_FRAMES = 60                  # hard ceiling on selected frames
 MIN_FRAMES = 8                   # floor for very short videos
@@ -205,6 +206,13 @@ def _process_frame(cv2, path: str):
         return None
 
     img_hash = _frame_hash(cv2, img)
+
+    # Drop composited letterbox bands first: they carry no content, and leaving
+    # them in drags down the screen-likeness score of the frame that does.
+    trimmed = trim_letterbox(cv2, img)
+    if trimmed is not None:
+        img = trimmed
+
     full_score = _score_image(cv2, img)
 
     quad = _detect_screen_quad(cv2, img)
@@ -220,6 +228,10 @@ def _process_frame(cv2, path: str):
             crop_score = _score_image(cv2, cropped) + _CROP_BONUS
             cv2.imwrite(path, cropped, [cv2.IMWRITE_JPEG_QUALITY, 90])
             return crop_score, img_hash, True
+
+    if trimmed is not None:
+        cv2.imwrite(path, img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        return full_score, img_hash, True
 
     return full_score, img_hash, False
 
