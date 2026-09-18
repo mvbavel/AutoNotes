@@ -69,9 +69,36 @@ jobs:
           retention-days: 14
 
       # Only publish a GitHub Release when a version tag is pushed (e.g. v1.2.0)
+      #
+      # Done with gh rather than an action because the upload needs retries: the
+      # ~400 MB DMG occasionally dies mid-stream ("other side closed") when the
+      # release-asset endpoint is degraded, and a one-shot upload turns a
+      # transient blip into a stuck release. Publishing is deferred until the
+      # asset is attached, so a failure never leaves a visible release that
+      # nothing can be downloaded from. Every step is idempotent, so re-running
+      # the job after a failure resumes rather than duplicating.
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v3
-        with:
-          files: dist/AutoNotes.dmg
-          generate_release_notes: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --draft --verify-tag --generate-notes
+
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$TAG" dist/AutoNotes.dmg --clobber; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::DMG upload failed after $attempt attempts"
+              exit 1
+            fi
+            delay=$((attempt * 30))
+            echo "::warning::Upload attempt $attempt failed; retrying in ${delay}s"
+            sleep "$delay"
+          done
+
+          gh release edit "$TAG" --draft=false
