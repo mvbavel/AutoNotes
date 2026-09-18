@@ -3,10 +3,12 @@ import json
 import os
 import re
 import subprocess
+from collections import deque
 
 from pipeline._paths import FFMPEG, ytdlp_command
 from pipeline._util import PipelineCancelled, safe_filename
 from pipeline.vtt_parser import parse_srt
+from pipeline.ytdlp_health import diagnose
 
 YTDLP_CMD = ytdlp_command()
 
@@ -60,6 +62,9 @@ def download_youtube(
         stderr=subprocess.STDOUT,
         text=True,
     )
+    # Kept so a failure can be explained: yt-dlp reports an aged-out extractor
+    # as a transport or format error, and the exit code alone says nothing.
+    tail = deque(maxlen=40)
     try:
         for line in proc.stdout:
             if cancel_check:
@@ -67,6 +72,7 @@ def download_youtube(
             line = line.rstrip()
             if not line:
                 continue
+            tail.append(line)
             m = re.search(r"(\d+(?:\.\d+)?)%", line)
             if m:
                 pct = min(int(float(m.group(1))), 100)
@@ -82,7 +88,10 @@ def download_youtube(
             proc.kill()
             proc.wait()
     if proc.returncode != 0:
-        raise RuntimeError(f"yt-dlp exited with code {proc.returncode}")
+        hint = diagnose(tail)
+        raise RuntimeError(
+            f"yt-dlp exited with code {proc.returncode}" + (f". {hint}" if hint else "")
+        )
 
     out_path = _find_output(output_dir, safe_title)
     if out_path is None:

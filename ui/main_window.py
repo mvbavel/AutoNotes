@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
 )
 
 from pipeline.worker import ProcessingWorker, load_saved_transcript
+from pipeline.ytdlp_health import staleness_warning
 from ui.secure_store import load_secret, save_secret
 from version import __version__
 
@@ -36,6 +37,7 @@ class MainWindow(QMainWindow):
         self._settings = QSettings("AutoNotes", "AutoNotes")
         self._build_ui()
         self._load_settings()
+        self._warn_if_ytdlp_stale()
 
     # ── UI Construction ──────────────────────────────────────────────────
 
@@ -366,6 +368,16 @@ class MainWindow(QMainWindow):
         # Overall = completed stages + fractional progress of the current one
         overall = int(((self._current_stage - 1) + pct / 100) / self._total_stages * 100)
         self.progress_bar.setValue(max(self.progress_bar.value(), overall))
+
+    def _warn_if_ytdlp_stale(self):
+        """Flag an aged-out yt-dlp at launch rather than mid-download.
+
+        Otherwise the first sign is a 403 several minutes into a run, which
+        reads as a network fault rather than a version that needs updating.
+        """
+        warning = staleness_warning()
+        if warning:
+            self._on_log(f"Warning: {warning}")
 
     def _on_log(self, msg: str):
         self.log_text.append(msg)
