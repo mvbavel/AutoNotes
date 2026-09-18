@@ -1,0 +1,110 @@
+# Catches yt-dlp extractor rot before a user does.
+#
+# A shipped .app re-execs its own bundled yt_dlp (pipeline/_paths.ytdlp_command),
+# which nobody can upgrade in place — so a build's yt-dlp only ever falls further
+# behind YouTube, and the first sign is a 403 in someone's hands. The in-app
+# staleness warning reports that after the fact; this is what gets ahead of it.
+#
+# Deliberately separate from build.yml: no pip cache, so each run resolves the
+# newest yt-dlp rather than replaying the one that was current when the cache was
+# written, and a failure here must never touch the release path.
+name: Monthly rebuild
+
+on:
+  schedule:
+    - cron: '0 6 1 * *'   # 06:00 UTC, 1st of the month
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rebuild:
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      - name: Install Homebrew dependencies
+        run: brew install ffmpeg
+
+      # No cache: resolving fresh is the entire point of this workflow.
+      - name: Install Python dependencies
+        run: |
+          pip3 install -r requirements.txt
+          pip3 install pyinstaller
+
+      - name: Report yt-dlp version
+        run: |
+          python3 -c "
+          from pipeline.ytdlp_health import installed_version, age_days, staleness_warning
+          v, age = installed_version(), age_days()
+          print(f'yt-dlp {v} ({age} days old)')
+          w = staleness_warning()
+          print(f'::warning::{w}' if w else 'Within the freshness threshold.')
+          "
+
+      - name: Run tests
+        run: python3 -m unittest discover tests -v
+
+      # The check that matters. A metadata fetch is not enough: when 2026.07.04
+      # broke, extraction succeeded and it was the media CDN URLs that 403'd, so
+      # only pulling actual bytes reproduces it. Runs through main.py --yt-dlp to
+      # exercise the same dispatch and TLS setup the app uses, with the same
+      # format string as pipeline/downloader.py.
+      #
+      # The default clip is the oldest video on YouTube — chosen for staying up,
+      # since a smoke test that fails because its video was deleted is worse than
+      # one that misses a subtlety. It is 240p, so it proves the CDN path works
+      # but cannot detect a drop to low-quality-only formats; point
+      # SMOKE_VIDEO_URL at an HD video if you want that covered too.
+      - name: Smoke-test a real YouTube download
+        env:
+          SMOKE_URL: ${{ vars.SMOKE_VIDEO_URL || 'https://www.youtube.com/watch?v=jNQXAC9IVRw' }}
+        run: |
+          set -euo pipefail
+          python3 main.py --yt-dlp \
+            --no-playlist \
+            --format 'bestvideo+bestaudio/best' \
+            --merge-output-format mp4/mkv \
+            --ffmpeg-location /opt/homebrew/bin \
+            -o 'smoke.%(ext)s' \
+            "$SMOKE_URL"
+          # || true: pipefail would otherwise abort here on no match, losing
+          # the diagnostic below and leaving CI with a bare non-zero exit.
+          file=$(ls smoke.* 2>/dev/null | head -1 || true)
+          if [ -z "${file:-}" ]; then
+            echo "::error::yt-dlp reported success but produced no file"
+            exit 1
+          fi
+          size=$(stat -f%z "$file")
+          echo "Downloaded $file ($size bytes)"
+          # A few KB means a stub or an error page, not video.
+          if [ "$size" -lt 100000 ]; then
+            echo "::error::Downloaded file is implausibly small — extractor may be degraded"
+            exit 1
+          fi
+
+      - name: Build AutoNotes.app
+        run: python3 -m PyInstaller --noconfirm --log-level WARN AutoNotes.spec
+
+      - name: Ad-hoc sign .app
+        run: codesign --force --deep --sign - dist/AutoNotes.app || true
+
+      - name: Create DMG
+        run: bash make_dmg.sh
+
+      # Not released: a rebuild with no version bump is a health check, not a
+      # shipment. Kept so a fresh build is on hand if this run is what reveals
+      # that the released one has rotted.
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: AutoNotes-dmg-monthly
+          path: dist/AutoNotes.dmg
+          retention-days: 30
