@@ -154,7 +154,11 @@ def _generate_chunked(
     return {"title": title, "chapters": all_chapters, "screenshot_boxes": all_boxes}
 
 
-def _call_with_retry(client, content, cancel_check=None, log_cb=None):
+# Error-event types worth retrying when they arrive mid-stream
+_RETRYABLE_STREAM_ERRORS = {"overloaded_error", "api_error", "rate_limit_error"}
+
+
+def _is_retryable(exc) -> bool:
     import anthropic
     import httpx
 
@@ -162,11 +166,23 @@ def _call_with_retry(client, content, cancel_check=None, log_cb=None):
     # reset, timeouts, RemoteProtocolError) that the SDK does NOT wrap in
     # APIConnectionError once the stream is being iterated — without it a
     # network blip minutes into a response kills the whole pipeline.
-    retryable = (anthropic.RateLimitError,
-                 anthropic.InternalServerError,
-                 anthropic.APIConnectionError,
-                 httpx.TransportError)
+    # OverloadedError (529) is not an InternalServerError subclass.
+    if isinstance(exc, (anthropic.RateLimitError,
+                        anthropic.InternalServerError,
+                        anthropic.OverloadedError,
+                        anthropic.APIConnectionError,
+                        httpx.TransportError)):
+        return True
+    # An error event mid-stream arrives on the already-200 response, so the
+    # SDK can't map it to a typed subclass — classify by the event body
+    if isinstance(exc, anthropic.APIStatusError):
+        body = exc.body if isinstance(exc.body, dict) else {}
+        error = body.get("error") if isinstance(body.get("error"), dict) else {}
+        return error.get("type") in _RETRYABLE_STREAM_ERRORS
+    return False
 
+
+def _call_with_retry(client, content, cancel_check=None, log_cb=None):
     last_exc = None
     for attempt in range(MAX_RETRIES):
         if cancel_check:
@@ -187,7 +203,9 @@ def _call_with_retry(client, content, cancel_check=None, log_cb=None):
                     if cancel_check:
                         cancel_check()
                 return stream.get_final_message()
-        except retryable as exc:
+        except Exception as exc:
+            if not _is_retryable(exc):
+                raise
             last_exc = exc
             if attempt < MAX_RETRIES - 1:
                 wait = _RETRY_BASE_WAIT * (2 ** attempt)

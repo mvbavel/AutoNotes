@@ -6,9 +6,18 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import anthropic
 import httpx
 
 from pipeline import note_generator
+
+
+def _response(status: int) -> httpx.Response:
+    return httpx.Response(status, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+
+
+def _error_body(error_type: str) -> dict:
+    return {"type": "error", "error": {"type": error_type, "message": error_type}}
 
 
 class _FakeStream:
@@ -75,6 +84,35 @@ class TestCallWithRetry(unittest.TestCase):
             note_generator._call_with_retry(client, [], log_cb=logs.append)
         self.assertEqual(client.attempts, note_generator.MAX_RETRIES)
         self.assertTrue(any("failed after" in m for m in logs))
+
+    def test_overloaded_529_is_retried(self):
+        # OverloadedError is not an InternalServerError subclass, so it needs
+        # to be listed explicitly
+        client = _FakeClient([
+            _FakeStream(fail_with=anthropic.OverloadedError(
+                "overloaded", response=_response(529), body=_error_body("overloaded_error"))),
+            _FakeStream(message="recovered"),
+        ])
+        self.assertEqual(note_generator._call_with_retry(client, []), "recovered")
+        self.assertEqual(client.attempts, 2)
+
+    def test_mid_stream_overloaded_event_is_retried(self):
+        # An error event mid-stream arrives on the 200 response, so the SDK
+        # raises a bare APIStatusError rather than a typed subclass
+        client = _FakeClient([
+            _FakeStream(fail_with=anthropic.APIStatusError(
+                "overloaded", response=_response(200), body=_error_body("overloaded_error"))),
+            _FakeStream(message="recovered"),
+        ])
+        self.assertEqual(note_generator._call_with_retry(client, []), "recovered")
+        self.assertEqual(client.attempts, 2)
+
+    def test_mid_stream_invalid_request_is_not_retried(self):
+        client = _FakeClient([_FakeStream(fail_with=anthropic.APIStatusError(
+            "bad", response=_response(200), body=_error_body("invalid_request_error")))])
+        with self.assertRaises(anthropic.APIStatusError):
+            note_generator._call_with_retry(client, [])
+        self.assertEqual(client.attempts, 1)
 
     def test_non_retryable_error_propagates_immediately(self):
         client = _FakeClient([_FakeStream(fail_with=ValueError("boom"))])
