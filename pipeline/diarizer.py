@@ -17,14 +17,18 @@ def diarize(audio_path: str, segments: list[dict], hf_token,
 
         pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            use_auth_token=hf_token,
+            token=hf_token,
         )
         pipeline.to(torch.device("cpu"))
 
         if progress_cb:
             progress_cb(30)
 
-        diarization = pipeline(audio_path)
+        output = pipeline(audio_path)
+        # pyannote 4 returns a DiarizeOutput; its exclusive (non-overlapping)
+        # view gives each moment exactly one speaker, which is what a
+        # transcript segment needs. Other pipelines return the Annotation itself.
+        diarization = getattr(output, "exclusive_speaker_diarization", output)
 
         if progress_cb:
             progress_cb(80)
