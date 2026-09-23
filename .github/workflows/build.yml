@@ -88,8 +88,23 @@ jobs:
           gh release view "$TAG" >/dev/null 2>&1 \
             || gh release create "$TAG" --draft --verify-tag --generate-notes
 
+          # gh can exit 0 without the asset landing (v1.6.4 published with no
+          # DMG), so success means a fully uploaded asset of the local size.
+          # Polled briefly because the release API lags a fresh upload.
+          expected=$(stat -f%z dist/AutoNotes.dmg)
+          dmg_attached() {
+            for _ in 1 2 3 4 5 6; do
+              size=$(gh release view "$TAG" --json assets --jq \
+                '.assets[] | select(.name == "AutoNotes.dmg" and .state == "uploaded") | .size')
+              [ "$size" = "$expected" ] && return 0
+              sleep 5
+            done
+            echo "::warning::DMG not attached after upload (got size '${size:-none}', expected $expected)"
+            return 1
+          }
+
           for attempt in 1 2 3 4 5; do
-            if gh release upload "$TAG" dist/AutoNotes.dmg --clobber; then
+            if gh release upload "$TAG" dist/AutoNotes.dmg --clobber && dmg_attached; then
               break
             fi
             if [ "$attempt" -eq 5 ]; then
