@@ -9,7 +9,7 @@ AutoNotes is a **PyQt6 desktop app** (macOS) that turns a YouTube/Teams/SharePoi
 recording into a DOCX of AI notes plus screenshots. All paths below are relative
 to the repo root; run every command from there.
 
-Drive it with **`.claude/skills/run-autonotes/driver.py`**. It renders the real
+Drive it with **`.agents/skills/run-autonotes/driver.py`**. It renders the real
 `MainWindow` under Qt's `offscreen` platform, so it screenshots and inspects
 widgets with no display and **no macOS Screen Recording grant** — plain
 `screencapture` fails here (see Gotchas). It also runs the heavy pipeline stages
@@ -32,8 +32,8 @@ brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
 `main.py --yt-dlp` against the importable `yt_dlp` package, so the venv's copy
 is what runs and `/opt/homebrew/bin/yt-dlp` is never invoked. It does need to
 stay current — extractors rot, and a stale copy 403s every YouTube download and
-silently breaks the SharePoint extractor. Use the **check-ytdlp** skill
-(`.claude/skills/check-ytdlp/`) to check it, diagnose a failed download, or
+silently breaks the SharePoint extractor. Follow `.claude/skills/check-ytdlp/SKILL.md`
+(no Codex copy) to check it, diagnose a failed download, or
 upgrade the right one of the two installs.
 
 ## Setup
@@ -59,14 +59,14 @@ source .venv/bin/activate
 **Screenshot the UI + dump widget state** (JSON to stdout):
 
 ```bash
-python3 .claude/skills/run-autonotes/driver.py gui --screenshot /tmp/gui.png
+python3 .agents/skills/run-autonotes/driver.py gui --screenshot /tmp/gui.png
 ```
 
 Reach the enabled "Ready" state — the button needs a URL *and* a key, and the
 driver blanks real secrets by default:
 
 ```bash
-python3 .claude/skills/run-autonotes/driver.py gui \
+python3 .agents/skills/run-autonotes/driver.py gui \
   --screenshot /tmp/ready.png \
   --url "https://www.youtube.com/watch?v=dQw4w9WgXcQ" \
   --api-key dummy
@@ -82,7 +82,7 @@ and `write_docx`, then asserts frames were selected and images embedded. ~8 s,
 no network, no API spend:
 
 ```bash
-python3 .claude/skills/run-autonotes/driver.py pipeline --out /tmp/smoke
+python3 .agents/skills/run-autonotes/driver.py pipeline --out /tmp/smoke
 ```
 
 Expect `PASS  8 frames -> …/driver_smoke_notes.docx`. **Fewer than 8 frames means
@@ -91,13 +91,13 @@ dedup is over-collapsing** — that is the signal this smoke test exists to catc
 **Check a Teams/SharePoint URL resolves** (network, no API spend):
 
 ```bash
-python3 .claude/skills/run-autonotes/driver.py probe "<sharepoint-stream-url>"
+python3 .agents/skills/run-autonotes/driver.py probe "<sharepoint-stream-url>"
 ```
 
 **Tests** (89 of them; ~1 s warm, ~19 s on the first run while torch imports):
 
 ```bash
-python3 .claude/skills/run-autonotes/driver.py tests
+python3 .agents/skills/run-autonotes/driver.py tests
 # same as: python3 -m unittest discover tests -v
 ```
 
