@@ -28,6 +28,12 @@ FFPROBE = _find_binary("ffprobe")
 _MAIN_PY = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py")
 
 
+# Fetch DASH/HLS fragments in parallel: Teams recordings arrive as ~1,350
+# fragments for an hour, and one at a time took ~20 minutes. Kept modest so
+# SharePoint doesn't start answering 429s. No effect on single-file formats.
+YTDLP_FRAGMENT_ARGS = ["--concurrent-fragments", "4"]
+
+
 def ytdlp_command() -> list[str]:
     """Command prefix for invoking yt-dlp.
 

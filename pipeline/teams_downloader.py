@@ -5,7 +5,7 @@ import os
 import re
 import subprocess
 
-from pipeline._paths import FFMPEG, ytdlp_command
+from pipeline._paths import FFMPEG, YTDLP_FRAGMENT_ARGS, ytdlp_command
 from pipeline._util import safe_filename
 from pipeline.sharepoint_transcript import fetch_transcript
 from pipeline.vtt_parser import parse_srt, parse_vtt
@@ -260,6 +260,7 @@ def _run_download(url: str, out_template: str, ffmpeg_dir: str, browser: str,
         *YTDLP_CMD,
         "--cookies-from-browser", browser,
         "--no-playlist",
+        *YTDLP_FRAGMENT_ARGS,
         "--format", "bestvideo+bestaudio/best",
         "--merge-output-format", "mp4/mkv",
         "--ffmpeg-location", ffmpeg_dir,

@@ -5,7 +5,7 @@ import re
 import subprocess
 from collections import deque
 
-from pipeline._paths import FFMPEG, ytdlp_command
+from pipeline._paths import FFMPEG, YTDLP_FRAGMENT_ARGS, ytdlp_command
 from pipeline._util import PipelineCancelled, safe_filename
 from pipeline.vtt_parser import parse_srt
 from pipeline.ytdlp_health import diagnose
@@ -44,6 +44,7 @@ def download_youtube(
     dl_args = [
         *YTDLP_CMD,
         *_BASE_ARGS,
+        *YTDLP_FRAGMENT_ARGS,
         # Highest resolution regardless of container: 1440p/4K on YouTube is
         # VP9/AV1, which an mp4-first format string silently caps at 1080p.
         # Merge prefers mp4, falls back to mkv for codecs mp4 can't carry —
