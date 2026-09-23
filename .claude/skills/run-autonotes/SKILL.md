@@ -21,38 +21,20 @@ subcommand invokes it, so iterate freely.
 ## Prerequisites
 
 `ffmpeg`/`ffprobe` must be at `/opt/homebrew/bin` (hardcoded in
-`pipeline/_paths.py`), and the app shells out to the **system** `yt-dlp`:
-
-Install only if missing — a bare `brew install` on an already-present formula
-silently *upgrades* it, which is not yours to do:
+`pipeline/_paths.py`). Install only if missing — a bare `brew install` on an
+already-present formula silently *upgrades* it, which is not yours to do:
 
 ```bash
 brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
-brew list yt-dlp >/dev/null 2>&1 || brew install yt-dlp
 ```
 
-`yt-dlp` does need to stay current: `requirements.txt` pins `>=2026.8.19`
-because extractors rot. A stale copy silently breaks the SharePoint extractor,
-and anything below `2026.8.19` falls back to the `android_vr` player client,
-whose CDN URLs YouTube now rejects — every YouTube download dies with
-`unable to download video data: HTTP Error 403: Forbidden`. Check it:
-
-```bash
-/opt/homebrew/bin/yt-dlp --version   # must be >= 2026.08.19
-```
-
-**`brew upgrade yt-dlp` does not fix this.** `/opt/homebrew/bin/yt-dlp` is a
-pip-installed console script that *shadows* the Homebrew formula's binary, so
-upgrading the formula changes nothing the app runs (brew even warns:
-`executables are shadowed by other commands earlier in your PATH`). Upgrade the
-pip copy that actually answers — the same interpreter `build.sh` bundles from:
-
-```bash
-/opt/homebrew/bin/python3 -m pip install --break-system-packages --upgrade yt-dlp
-```
-
-`yt-dlp -v` prints its own provenance (`from yt-dlp/yt-dlp [hash] (pip)`) if you
-need to confirm which install is winning.
+`yt-dlp` needs no Homebrew install: `_paths.ytdlp_command()` re-execs
+`main.py --yt-dlp` against the importable `yt_dlp` package, so the venv's copy
+is what runs and `/opt/homebrew/bin/yt-dlp` is never invoked. It does need to
+stay current — extractors rot, and a stale copy 403s every YouTube download and
+silently breaks the SharePoint extractor. Use the **check-ytdlp** skill
+(`.claude/skills/check-ytdlp/`) to check it, diagnose a failed download, or
+upgrade the right one of the two installs.
 
 ## Setup
 

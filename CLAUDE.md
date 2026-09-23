@@ -13,9 +13,7 @@ pip install -r requirements.txt   # includes PyQt6
 python3 main.py
 ```
 
-The venv is **required**, not a preference: Homebrew's Python is externally managed, so `pip3 install -r requirements.txt` aborts with `externally-managed-environment` (PEP 668), and `/opt/homebrew/bin/python3` has no PyQt6 of its own. `ffmpeg`/`ffprobe` must be on Homebrew (`/opt/homebrew/bin`), and the pipeline invokes yt-dlp by re-execing `main.py --yt-dlp` in *both* dev and frozen mode, so the venv's `yt_dlp` package is what runs — `pip install -r requirements.txt` keeps it current, and the `/opt/homebrew/bin/yt-dlp` binary is no longer on the app's path at all. Keep it at or above the `requirements.txt` floor: a stale yt-dlp breaks the SharePoint extractor and gets every YouTube download 403'd (below `2026.8.19` it falls back to the `android_vr` client, whose CDN URLs YouTube now rejects).
-
-Note `/opt/homebrew/bin/yt-dlp` is a *pip* console script installed into Homebrew's Python, not the Homebrew formula — that pip package is what `AutoNotes.spec` bundles via `collect_all('yt_dlp')`, so `build.sh` needs it even though the app no longer shells out to it. Upgrade that one with `/opt/homebrew/bin/python3 -m pip install --break-system-packages --upgrade yt-dlp`; `brew upgrade yt-dlp` does nothing for it.
+The venv is **required**, not a preference: Homebrew's Python is externally managed, so `pip3 install -r requirements.txt` aborts with `externally-managed-environment` (PEP 668), and `/opt/homebrew/bin/python3` has no PyQt6 of its own. `ffmpeg`/`ffprobe` must be on Homebrew (`/opt/homebrew/bin`). yt-dlp runs as the venv's `yt_dlp` *package*, never a system binary, and must stay current or downloads 403 — use the `check-ytdlp` skill (`.claude/skills/check-ytdlp/`) to check, diagnose or upgrade it.
 
 Note `ps` shows the Homebrew `Python.app` binary even when running from the venv (macOS venvs exec the base framework stub for GUI support) — check `sys.prefix` to confirm which environment is live.
 
@@ -55,7 +53,7 @@ Cancellation is cooperative: the worker raises `PipelineCancelled` (`pipeline/_u
 | Symbol | Location | Value |
 |---|---|---|
 | `FFMPEG` / `FFPROBE` | `transcriber.py`, `frame_extractor.py` | `/opt/homebrew/bin/ffmpeg` |
-| `YTDLP_CMD` | `_paths.ytdlp_command()` | dev: system `yt-dlp`; frozen app: `[sys.executable, "--yt-dlp"]` re-exec running the bundled `yt_dlp` package (dispatch at the top of `main.py`) |
+| `YTDLP_CMD` | `_paths.ytdlp_command()` | `[sys.executable, "--yt-dlp"]` re-exec running the importable `yt_dlp` package, in dev and frozen alike (dispatch at the top of `main.py`); a system binary only if `main.py` is missing |
 | `MODEL` | `note_generator.py` | `"claude-sonnet-5"` (env override: `AUTONOTES_MODEL`) |
 | `MAX_FRAMES` / `MIN_FRAMES` | `frame_extractor.py` | `60` / `8` — budget is `duration / TARGET_SECONDS_PER_FRAME` (30 s) clamped between them, so short videos get 1 frame/30s and long ones degrade toward 1/min+ |
 | `MAX_SCREENSHOTS` | `note_generator.py` | `60` (sent to Claude; chunked mode splits 30 per call) |
