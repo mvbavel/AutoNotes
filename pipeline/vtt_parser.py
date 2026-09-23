@@ -2,6 +2,11 @@
 import json
 import re
 
+# Longest span a merged segment may cover. Each segment carries one timestamp,
+# so unbounded merging turned a presenter's monologue into a single 9-minute
+# block — too coarse to line screenshots up with speech or time chapters.
+MAX_MERGED_SECONDS = 45
+
 
 def parse_vtt(path: str) -> list[dict]:
     """Return [{start, end, speaker, text}] from a VTT file.
@@ -103,7 +108,9 @@ def _merge_consecutive(segments: list[dict]) -> list[dict]:
     """Merge back-to-back cues from the same speaker into one segment."""
     merged = []
     for seg in segments:
-        if merged and merged[-1]["speaker"] == seg["speaker"] and seg["start"] - merged[-1]["end"] < 1.5:
+        if (merged and merged[-1]["speaker"] == seg["speaker"]
+                and seg["start"] - merged[-1]["end"] < 1.5
+                and seg["end"] - merged[-1]["start"] <= MAX_MERGED_SECONDS):
             merged[-1]["end"] = seg["end"]
             merged[-1]["text"] += " " + seg["text"]
         else:

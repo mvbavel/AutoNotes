@@ -11,6 +11,7 @@ from pipeline.sharepoint_transcript import (
     _parse_sp_item_url,
     _pick_transcript,
 )
+from pipeline.vtt_parser import MAX_MERGED_SECONDS
 
 
 class TestParseSpItemUrl(unittest.TestCase):
@@ -99,6 +100,23 @@ class TestEntriesToSegments(unittest.TestCase):
         self.assertEqual(segments[0]["text"], "First part second part")
         self.assertEqual(segments[0]["end"], 9.0)
         self.assertEqual(segments[1]["speaker"], "Bo")
+
+    def test_long_monologue_split_to_keep_timestamps(self):
+        # Regression: one presenter's continuous talk merged into a single
+        # 523s segment, leaving Claude one timestamp for nine minutes of speech
+        entries = [
+            self._entry(f"00:{i * 5 // 60:02d}:{i * 5 % 60:02d}.000",
+                        f"00:{(i * 5 + 5) // 60:02d}:{(i * 5 + 5) % 60:02d}.000",
+                        "Ana", f"sentence {i}")
+            for i in range(60)   # 300s of back-to-back cues
+        ]
+        segments = _entries_to_segments(entries)
+        self.assertGreater(len(segments), 1)
+        for seg in segments:
+            self.assertLessEqual(seg["end"] - seg["start"], MAX_MERGED_SECONDS)
+        # Splitting must not drop or reorder text
+        self.assertEqual(" ".join(s["text"] for s in segments),
+                         " ".join(f"sentence {i}" for i in range(60)))
 
     def test_hour_offsets(self):
         entries = [self._entry("01:02:03.500", "01:02:04.500", "Ana", "Late")]
