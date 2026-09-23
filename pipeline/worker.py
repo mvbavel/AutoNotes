@@ -14,7 +14,7 @@ from pipeline.transcriber import extract_audio, transcribe
 from pipeline.diarizer import diarize
 from pipeline.frame_extractor import extract_frames
 from pipeline.note_generator import generate_notes
-from output.docx_writer import write_docx
+from output.docx_writer import check_output_dir, write_docx
 
 # Debug artifacts from the most recent run (log + selected frames),
 # kept outside the temp dir so they survive pipeline cleanup
@@ -62,6 +62,10 @@ class ProcessingWorker(QThread):
 
     def _run_pipeline(self, temp_dir: str):
         total = len(self.STAGES)
+        output_dir = self.config.get("output_dir", os.path.expanduser("~/Desktop"))
+        problem = check_output_dir(output_dir)
+        if problem:
+            raise RuntimeError(problem)
 
         # ── Stage 1: Download / load ──────────────────────────────────────
         self._stage(1, total)
@@ -245,13 +249,24 @@ class ProcessingWorker(QThread):
         # ── Stage 7: Write DOCX ───────────────────────────────────────────
         self._stage(7, total)
         self._log("Writing document…")
-        output_dir = self.config.get("output_dir", os.path.expanduser("~/Desktop"))
-        out_path = write_docx(notes, frames, output_dir, safe_title,
-                              log_cb=self._log, source_info=source_info)
+        out_path = self._write_document(notes, frames, output_dir, safe_title,
+                                        source_info)
         self._progress(100)
         self._log(f"Saved: {out_path}")
 
         self.completed.emit(out_path)
+
+    def _write_document(self, notes, frames, output_dir, safe_title, source_info):
+        """Save the DOCX, falling back to the log dir if the output folder
+        stopped being writable mid-run — never throw away a finished run."""
+        try:
+            return write_docx(notes, frames, output_dir, safe_title,
+                              log_cb=self._log, source_info=source_info)
+        except OSError as e:
+            self._log(f"Could not save to {output_dir} ({e.strerror or e}) — "
+                      f"saving to {DEBUG_DIR} instead")
+            return write_docx(notes, frames, DEBUG_DIR, safe_title,
+                              log_cb=self._log, source_info=source_info)
 
     def _check_cancel(self):
         if self._cancelled:

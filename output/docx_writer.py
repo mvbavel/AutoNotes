@@ -1,5 +1,6 @@
 import os
 import re
+import tempfile
 from docx import Document
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.shared import Inches, Pt, RGBColor
@@ -24,9 +25,38 @@ def write_docx(notes: dict, frames: list[dict], output_dir: str, safe_title: str
         _add_chapter(doc, chapter, frames_by_idx, boxes, log_cb)
 
     os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, f"{safe_title}_notes.docx")
+    out_path = _unused_path(output_dir, f"{safe_title}_notes")
     doc.save(out_path)
     return out_path
+
+
+def check_output_dir(output_dir: str) -> str | None:
+    """Return why a document can't be saved into output_dir, or None if it can.
+
+    Run before the pipeline so an unwritable folder fails in seconds, not after
+    the download and Claude call. A macOS privacy denial (e.g. no Desktop
+    access) surfaces as FileExistsError from makedirs, so probe with a write.
+    """
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=output_dir, prefix=".autonotes_probe_"):
+            pass
+    except OSError as e:
+        return (f"Can't save to the output folder {output_dir} ({e.strerror or e}). "
+                "Choose another folder, or allow AutoNotes access in System Settings "
+                "→ Privacy & Security → Files and Folders.")
+    return None
+
+
+def _unused_path(output_dir: str, stem: str) -> str:
+    """First free '<stem>.docx', '<stem> (2).docx', … — never replace a
+    document the user may have edited or still have open in Word."""
+    path = os.path.join(output_dir, f"{stem}.docx")
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(output_dir, f"{stem} ({n}).docx")
+        n += 1
+    return path
 
 
 def _setup_styles(doc: Document):
