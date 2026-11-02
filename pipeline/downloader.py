@@ -5,6 +5,7 @@ import re
 import subprocess
 from collections import deque
 
+from pipeline import kaltura
 from pipeline._paths import FFMPEG, YTDLP_FRAGMENT_ARGS, ytdlp_command
 from pipeline._util import PipelineCancelled, safe_filename
 from pipeline.vtt_parser import parse_srt
@@ -33,7 +34,7 @@ def download_youtube(
     Also attempts to download subtitles (manual then auto-generated) as SRT files
     alongside the video. Callers can look for *.srt files in output_dir afterward.
     """
-    info = _run_json(YTDLP_CMD + _BASE_ARGS + ["--dump-single-json", url])
+    url, info = _resolve_metadata(url, log_cb)
     title = info.get("title", "video")
     description = info.get("description", "") or ""
     chapters = info.get("chapters") or []
@@ -101,6 +102,21 @@ def download_youtube(
     _download_subtitles(url, out_template, ffmpeg_dir, _pick_sub_lang(info), log_cb, cancel_check)
 
     return out_path, title, description, chapters
+
+
+def _resolve_metadata(url: str, log_cb=None) -> tuple[str, dict]:
+    """Return (url to download, metadata) for the first candidate yt-dlp accepts."""
+    *alternatives, original = kaltura.candidate_urls(url)
+    for candidate in alternatives:
+        try:
+            info = _run_json(YTDLP_CMD + _BASE_ARGS + ["--dump-single-json", candidate])
+        except RuntimeError:
+            continue
+        if log_cb:
+            log_cb(f"Resolved Kaltura player page to {candidate}")
+        return candidate, info
+    # Last so a total failure reports the user's URL, not a synthesised one.
+    return original, _run_json(YTDLP_CMD + _BASE_ARGS + ["--dump-single-json", original])
 
 
 def _pick_sub_lang(info: dict) -> str | None:
