@@ -6,8 +6,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Homebrew Python — the interpreter the app and all deps are installed on
-PYTHON="/opt/homebrew/bin/python3"
+# Homebrew Python — the interpreter the app and all deps are installed on.
+# Versioned on purpose: the unversioned python3 link follows Homebrew's
+# default Python (now 3.15), which has none of the build dependencies.
+PYTHON="/opt/homebrew/bin/python3.14"
 
 if ! "$PYTHON" -m PyInstaller --version >/dev/null 2>&1; then
     echo "Installing PyInstaller…"

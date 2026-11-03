@@ -148,7 +148,7 @@ source .venv/bin/activate && python3 main.py
   'yt-dlp[default,curl-cffi]'` *inside the venv*.
 - **`build.sh` still needs the pip `yt_dlp` in Homebrew's Python**, separately
   from the venv: `AutoNotes.spec` runs `collect_all('yt_dlp')` against that
-  interpreter. Upgrade that copy with `/opt/homebrew/bin/python3 -m pip install
+  interpreter. Upgrade that copy with `/opt/homebrew/bin/python3.14 -m pip install
   --break-system-packages -U yt-dlp` — `brew upgrade yt-dlp` does not touch it
   (`/opt/homebrew/bin/yt-dlp` is a pip console script, not the formula).
 - **Never `brew uninstall` a formula here without `--dry-run` first.** Homebrew
@@ -177,7 +177,7 @@ source .venv/bin/activate && python3 main.py
 | Symptom | Fix |
 |---|---|
 | `error: externally-managed-environment` from `pip3 install` | Use the venv (see Setup). Don't reach for `--break-system-packages`. |
-| `ModuleNotFoundError: No module named 'PyQt6'` | The venv isn't active, or you're on bare `/opt/homebrew/bin/python3`, which has no PyQt6. |
+| `ModuleNotFoundError: No module named 'PyQt6'` | The venv isn't active, or you're on bare `/opt/homebrew/bin/python3.14`, which has no PyQt6. |
 | `could not create image from display` | Screen Recording permission. Use `driver.py gui --screenshot`. |
 | `Session cookies are required for this URL … --cookies-from-browser will not work` | Open the recording in Edge and let it play, then retry. Also check yt-dlp is current (see Prerequisites — pip, not brew). |
 | `unable to download video data: HTTP Error 403: Forbidden` on every YouTube URL | Stale yt-dlp falling back to the `android_vr` client. Upgrade to `>=2026.8.19` (see Prerequisites). |

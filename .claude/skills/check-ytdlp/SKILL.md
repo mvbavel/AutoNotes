@@ -23,7 +23,7 @@ Two installs therefore matter, for two different purposes:
 | Install | Runs when | Upgrade with |
 |---|---|---|
 | `.venv/bin/python`'s `yt_dlp` | you run the app in dev | `source .venv/bin/activate && pip install -r requirements.txt` |
-| `/opt/homebrew/bin/python3`'s `yt_dlp` | `build.sh` / `AutoNotes.spec` bundles it into the `.app` | `/opt/homebrew/bin/python3 -m pip install --break-system-packages --upgrade yt-dlp` |
+| `/opt/homebrew/bin/python3.14`'s `yt_dlp` | `build.sh` / `AutoNotes.spec` bundles it into the `.app` | `/opt/homebrew/bin/python3.14 -m pip install --break-system-packages --upgrade yt-dlp` |
 
 `brew upgrade yt-dlp` fixes **neither**. The Homebrew formula's binary is not
 what `collect_all('yt_dlp')` bundles and not what either interpreter imports.
@@ -45,7 +45,7 @@ Before a release, check the **build** interpreter too, since that's the copy
 users get and cannot upgrade themselves:
 
 ```bash
-/opt/homebrew/bin/python3 -c "from yt_dlp.version import __version__; print(__version__)"
+/opt/homebrew/bin/python3.14 -c "from yt_dlp.version import __version__; print(__version__)"
 ```
 
 ## Reading the result

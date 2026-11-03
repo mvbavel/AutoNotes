@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 # AutoNotes.spec — PyInstaller build spec
-# Build with:  ./build.sh  (uses /opt/homebrew/bin/python3 -m PyInstaller)
+# Build with:  ./build.sh  (uses /opt/homebrew/bin/python3.14 -m PyInstaller)
 
 block_cipher = None
 

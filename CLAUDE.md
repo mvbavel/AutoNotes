@@ -13,13 +13,13 @@ pip install -r requirements.txt   # includes PyQt6
 python3 main.py
 ```
 
-The venv is **required**, not a preference: Homebrew's Python is externally managed, so `pip3 install -r requirements.txt` aborts with `externally-managed-environment` (PEP 668), and `/opt/homebrew/bin/python3` has no PyQt6 of its own. `ffmpeg`/`ffprobe` must be on Homebrew (`/opt/homebrew/bin`). yt-dlp runs as the venv's `yt_dlp` *package*, never a system binary, and must stay current or downloads 403 — use the `check-ytdlp` skill (`.claude/skills/check-ytdlp/`) to check, diagnose or upgrade it.
+The venv is **required**, not a preference: Homebrew's Python is externally managed, so `pip3 install -r requirements.txt` aborts with `externally-managed-environment` (PEP 668), and `/opt/homebrew/bin/python3.14` has no PyQt6 of its own. `ffmpeg`/`ffprobe` must be on Homebrew (`/opt/homebrew/bin`). yt-dlp runs as the venv's `yt_dlp` *package*, never a system binary, and must stay current or downloads 403 — use the `check-ytdlp` skill (`.claude/skills/check-ytdlp/`) to check, diagnose or upgrade it.
 
 Note `ps` shows the Homebrew `Python.app` binary even when running from the venv (macOS venvs exec the base framework stub for GUI support) — check `sys.prefix` to confirm which environment is live.
 
 To launch, screenshot or smoke-test the app without a display, use the `run-autonotes` skill (`.claude/skills/run-autonotes/`) rather than driving Qt by hand.
 
-Two setup paths deliberately differ from the above and should not be "fixed" to match it: `build.sh` targets `/opt/homebrew/bin/python3` and installs PyInstaller with `--break-system-packages`, so a PyInstaller build expects the dependencies importable by *that* interpreter, not the venv (untested against a venv). CI (`.github/workflows/build.yml`) uses a bare `pip3 install`, which is fine there because `actions/setup-python` provides an unmanaged interpreter.
+Two setup paths deliberately differ from the above and should not be "fixed" to match it: `build.sh` targets `/opt/homebrew/bin/python3.14` and installs PyInstaller with `--break-system-packages`, so a PyInstaller build expects the dependencies importable by *that* interpreter, not the venv (untested against a venv). CI (`.github/workflows/build.yml`) uses a bare `pip3 install`, which is fine there because `actions/setup-python` provides an unmanaged interpreter.
 
 ## Architecture
 
