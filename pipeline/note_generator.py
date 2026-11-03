@@ -154,8 +154,11 @@ def _generate_chunked(
     return {"title": title, "chapters": all_chapters, "screenshot_boxes": all_boxes}
 
 
-# Error-event types worth retrying when they arrive mid-stream
-_RETRYABLE_STREAM_ERRORS = {"overloaded_error", "api_error", "rate_limit_error"}
+# Error types worth retrying that the SDK raises as a bare APIStatusError:
+# mid-stream error events, and 408 timeout_error, which has no typed subclass
+# and which a large screenshot upload over a slow link hits repeatedly
+_RETRYABLE_STREAM_ERRORS = {"overloaded_error", "api_error", "rate_limit_error",
+                            "timeout_error"}
 
 
 def _is_retryable(exc) -> bool:

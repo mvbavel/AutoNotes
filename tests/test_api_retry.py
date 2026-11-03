@@ -107,6 +107,18 @@ class TestCallWithRetry(unittest.TestCase):
         self.assertEqual(note_generator._call_with_retry(client, []), "recovered")
         self.assertEqual(client.attempts, 2)
 
+    def test_request_timeout_408_is_retried(self):
+        # The SDK has no typed subclass for 408 and gives up after its own two
+        # quick retries — a large screenshot upload over a slow link then
+        # killed the run before our backoff ever ran
+        client = _FakeClient([
+            _FakeStream(fail_with=anthropic.APIStatusError(
+                "timeout", response=_response(408), body=_error_body("timeout_error"))),
+            _FakeStream(message="recovered"),
+        ])
+        self.assertEqual(note_generator._call_with_retry(client, []), "recovered")
+        self.assertEqual(client.attempts, 2)
+
     def test_mid_stream_invalid_request_is_not_retried(self):
         client = _FakeClient([_FakeStream(fail_with=anthropic.APIStatusError(
             "bad", response=_response(200), body=_error_body("invalid_request_error")))])
