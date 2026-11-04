@@ -61,6 +61,18 @@ _STAGE_LOOK = {
     "cancelled": ("warning", "warning", True),
 }
 
+# Filled buttons and the log surface. White text clears 4.5:1 on both fills;
+# the disabled fill sits near the window colour so an unavailable button isn't
+# the brightest thing in a dark window (the old #ccc was).
+_FILLS = {
+    "light": {"primary": "#1a62d6", "primary_hover": "#1550b0",
+              "success": "#137333", "success_hover": "#0f5c29",
+              "disabled": "#d9d9d9", "disabled_text": "#6b6b6b"},
+    "dark":  {"primary": "#1a62d6", "primary_hover": "#2f74e0",
+              "success": "#137333", "success_hover": "#1a8a40",
+              "disabled": "#4a4a4a", "disabled_text": "#a8a8a8"},
+}
+
 _ICON_PX = 14
 
 
@@ -156,6 +168,25 @@ class MainWindow(QMainWindow):
             style += " font-weight: bold;"
         lbl.setStyleSheet(style)
 
+    def _style_surfaces(self):
+        f = _FILLS["dark" if self._is_dark() else "light"]
+        self.process_btn.setStyleSheet(
+            f"QPushButton {{ background: {f['primary']}; color: #ffffff; border-radius: 6px;"
+            " font-size: 14px; font-weight: bold; }"
+            f"QPushButton:hover {{ background: {f['primary_hover']}; }}"
+            f"QPushButton:disabled {{ background: {f['disabled']}; color: {f['disabled_text']}; }}"
+        )
+        self.open_btn.setStyleSheet(
+            f"QPushButton {{ background: {f['success']}; color: #ffffff; border-radius: 6px;"
+            " font-size: 13px; font-weight: bold; }"
+            f"QPushButton:hover {{ background: {f['success_hover']}; }}"
+        )
+        pal = self.palette()
+        self.log_text.setStyleSheet(
+            f"QTextEdit {{ background: {pal.color(QPalette.ColorRole.Base).name()};"
+            f" color: {pal.color(QPalette.ColorRole.Text).name()};"
+            " border-radius: 4px; padding: 4px; }")
+
     def _restyle(self):
         for lbl in self.findChildren(QLabel):
             if lbl.property("tone") is not None:
@@ -166,6 +197,8 @@ class MainWindow(QMainWindow):
         if event.type() in (QEvent.Type.PaletteChange,
                             QEvent.Type.ApplicationPaletteChange):
             self._restyle()
+            if hasattr(self, "open_btn"):
+                self._style_surfaces()
             # Icons are pixmaps, so they don't follow the label tones on their own
             if hasattr(self, "stage_icons"):
                 self._render_stages()
@@ -180,12 +213,7 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(12)
 
-        # Title bar
-        title = QLabel("AutoNotes")
-        title.setFont(QFont("Helvetica Neue", 22, QFont.Weight.Bold))
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        root.addWidget(title)
-
+        # No in-window "AutoNotes" heading: the title bar already names the app
         subtitle = QLabel("Turns a meeting recording into Word notes with screenshots. "
                           f"Version {__version__}")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -193,6 +221,9 @@ class MainWindow(QMainWindow):
         root.addWidget(subtitle)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        # The native handle draws a lone grip dot mid-window; keep the drag area
+        # but paint nothing
+        splitter.setStyleSheet("QSplitter::handle { background: transparent; }")
         root.addWidget(splitter, stretch=1)
 
         splitter.addWidget(self._build_left_panel())
@@ -217,26 +248,28 @@ class MainWindow(QMainWindow):
         box = QGroupBox("Recording")
         layout = QVBoxLayout(box)
 
+        row = QHBoxLayout()
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("Paste a Teams, SharePoint or YouTube link, or browse for a video file")
         self.url_edit.textChanged.connect(self._on_input_changed)
-        layout.addWidget(self.url_edit)
+        row.addWidget(self.url_edit)
+
+        browse_btn = QPushButton("Browse…")
+        browse_btn.setMinimumWidth(90)
+        browse_btn.clicked.connect(self._browse_file)
+        row.addWidget(browse_btn)
+        layout.addLayout(row)
+
+        # Shown only once a file is chosen; "No file selected" was a permanent
+        # line of noise for the usual paste-a-link case
+        self.file_path_label = QLabel("")
+        self.file_path_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.file_path_label.setVisible(False)
+        layout.addWidget(self.file_path_label)
 
         self.input_status = QLabel("")
         self._set_tone(self.input_status, "info")
         layout.addWidget(self.input_status)
-
-        row = QHBoxLayout()
-        self.file_path_label = QLabel("No file selected")
-        self._set_tone(self.file_path_label, "muted")
-        self.file_path_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        row.addWidget(self.file_path_label)
-
-        browse_btn = QPushButton("Browse…")
-        browse_btn.setFixedWidth(90)
-        browse_btn.clicked.connect(self._browse_file)
-        row.addWidget(browse_btn)
-        layout.addLayout(row)
 
         return box
 
@@ -244,6 +277,9 @@ class MainWindow(QMainWindow):
         box = QGroupBox("Settings")
         form = QFormLayout(box)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        # The macOS style defaults to FieldsStayAtSizeHint, which leaves every
+        # line edit ~180 px wide no matter how wide the column is
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         self.api_key_edit = QLineEdit()
         self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -253,8 +289,8 @@ class MainWindow(QMainWindow):
 
         self.hf_token_edit = QLineEdit()
         self.hf_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.hf_token_edit.setPlaceholderText("Hugging Face token, optional")
-        form.addRow("Speaker names:", self.hf_token_edit)
+        self.hf_token_edit.setPlaceholderText("Optional, adds speaker names")
+        form.addRow("Hugging Face token:", self.hf_token_edit)
 
         self.model_combo = QComboBox()
         for label, model in _QUALITY:
@@ -303,7 +339,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.output_dir_edit)
 
         btn = QPushButton("Browse…")
-        btn.setFixedWidth(90)
+        btn.setMinimumWidth(90)
         btn.clicked.connect(self._browse_output_dir)
         row.addWidget(btn)
 
@@ -317,11 +353,6 @@ class MainWindow(QMainWindow):
         self.process_btn = QPushButton("Generate Notes")
         self.process_btn.setFixedHeight(40)
         self.process_btn.setEnabled(False)
-        self.process_btn.setStyleSheet(
-            "QPushButton { background: #1a73e8; color: white; border-radius: 6px; font-size: 14px; font-weight: bold; }"
-            "QPushButton:hover { background: #1558b0; }"
-            "QPushButton:disabled { background: #ccc; color: #888; }"
-        )
         self.process_btn.clicked.connect(self._start_processing)
         row.addWidget(self.process_btn)
 
@@ -382,27 +413,25 @@ class MainWindow(QMainWindow):
         self._set_tone(self.run_status, "", 12, bold=True)
         layout.addWidget(self.run_status)
 
-        # Log
-        log_label = QLabel("Log")
-        log_label.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
-        layout.addWidget(log_label)
-
+        # Log: a titled section like the others, on the theme's text surface
+        # rather than a fixed black slab
+        log_box = QGroupBox("Log")
+        log_layout = QVBoxLayout(log_box)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setFont(QFont("Menlo", 10))
-        self.log_text.setStyleSheet("background: #1e1e1e; color: #d4d4d4; border-radius: 4px;")
-        layout.addWidget(self.log_text, stretch=1)
+        self.log_text.setFrameShape(QFrame.Shape.NoFrame)
+        log_layout.addWidget(self.log_text)
+        layout.addWidget(log_box, stretch=1)
 
         # Open output button
         self.open_btn = QPushButton("Open Notes")
         self.open_btn.setFixedHeight(38)
         self.open_btn.setVisible(False)
-        self.open_btn.setStyleSheet(
-            "QPushButton { background: #34a853; color: white; border-radius: 6px; font-size: 13px; font-weight: bold; }"
-            "QPushButton:hover { background: #288543; }"
-        )
         self.open_btn.clicked.connect(self._open_output)
         layout.addWidget(self.open_btn)
+
+        self._style_surfaces()
 
         return panel
 
@@ -434,14 +463,10 @@ class MainWindow(QMainWindow):
 
     def _set_local_file(self, path: str):
         self._local_file = path
-        if path:
-            self.file_path_label.setText(os.path.basename(path))
-            self.file_path_label.setToolTip(path)
-            self._set_tone(self.file_path_label, "")
-        else:
-            self.file_path_label.setText("No file selected")
-            self.file_path_label.setToolTip("")
-            self._set_tone(self.file_path_label, "muted")
+        self.file_path_label.setText(f"File: {os.path.basename(path)}" if path else "")
+        self.file_path_label.setToolTip(path)
+        self._set_tone(self.file_path_label, "")
+        self.file_path_label.setVisible(bool(path))
 
     def _browse_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -700,6 +725,9 @@ class MainWindow(QMainWindow):
         self.output_dir_edit.setText(s.value("output_dir", ""))
         self.ms_client_id_edit.setText(s.value("ms_client_id", ""))
         self.ms_join_url_edit.setText(s.value("ms_join_url", ""))
+        # setText leaves the view scrolled to the end, which shows the meeting
+        # token; show the recognisable teams.microsoft.com start instead
+        self.ms_join_url_edit.setCursorPosition(0)
 
         # Refresh button state based on loaded settings
         self._on_input_changed()

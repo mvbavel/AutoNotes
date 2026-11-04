@@ -185,6 +185,52 @@ class TestCopy(MainWindowTestCase):
         self.assertNotIn(" — ", self.win.url_edit.placeholderText())
 
 
+def _qss_color(qss: str, selector: str, prop: str = "background"):
+    block = re.search(re.escape(selector) + r"\s*\{([^}]*)\}", qss)
+    m = block and re.search(rf"(?<![-\w]){prop}:\s*(#[0-9a-fA-F]{{3,6}})", block.group(1))
+    return QColor(m.group(1)) if m else None
+
+
+class TestNativeLayout(MainWindowTestCase):
+    """Issues seen only under the native macOS style, not offscreen Fusion."""
+
+    def test_form_fields_fill_the_column(self):
+        # macOS style defaults QFormLayout to FieldsStayAtSizeHint, which left
+        # the key and link fields about 180 px wide in a 500 px column
+        from PyQt6.QtWidgets import QFormLayout
+        form = self.win.api_key_edit.parentWidget().layout()
+        self.assertEqual(form.fieldGrowthPolicy(),
+                         QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+    def test_token_field_is_labelled_as_a_token(self):
+        # "Speaker names:" over a row of dots read as if names were hidden
+        form = self.win.hf_token_edit.parentWidget().layout()
+        self.assertIn("Hugging Face", form.labelForField(self.win.hf_token_edit).text())
+
+    def test_join_link_shows_its_start(self):
+        # QLineEdit scrolls to the end on setText, which displayed the meeting
+        # token instead of the recognisable teams.microsoft.com prefix
+        self.win._settings.setValue(
+            "ms_join_url", "https://teams.microsoft.com/l/meetup-join/" + "x" * 200)
+        self.win._load_settings()
+        self.assertEqual(self.win.ms_join_url_edit.cursorPosition(), 0)
+
+    def test_no_placeholder_file_row(self):
+        self.assertTrue(self.win.file_path_label.isHidden())
+        self.browse()
+        self.assertFalse(self.win.file_path_label.isHidden())
+
+    def test_no_duplicate_app_title(self):
+        # The window title bar already says AutoNotes
+        self.assertNotIn("AutoNotes", [l.text() for l in self.win.findChildren(QLabel)])
+
+    def test_log_is_a_titled_section_like_the_others(self):
+        from PyQt6.QtWidgets import QGroupBox
+        titles = {b.title(): b for b in self.win.findChildren(QGroupBox)}
+        self.assertIn("Log", titles)
+        self.assertTrue(titles["Log"].isAncestorOf(self.win.log_text))
+
+
 class TestLegibility(MainWindowTestCase):
     def _assert_labels_legible(self):
         bg = self.win.palette().color(QPalette.ColorRole.Window)
@@ -207,6 +253,41 @@ class TestLegibility(MainWindowTestCase):
     def test_light_theme(self):
         self._exercise_states()
         self._assert_labels_legible()
+
+    def _assert_buttons_legible(self):
+        win_bg = self.win.palette().color(QPalette.ColorRole.Window)
+        for btn, selector in [(self.win.process_btn, "QPushButton"),
+                              (self.win.open_btn, "QPushButton")]:
+            qss = btn.styleSheet()
+            bg, fg = _qss_color(qss, selector), _qss_color(qss, selector, "color")
+            self.assertGreaterEqual(_contrast(fg, bg), _MIN_CONTRAST,
+                                    f"{btn.text()}: {fg.name()} on {bg.name()}")
+        # A disabled button shouldn't be the brightest thing in a dark window
+        qss = self.win.process_btn.styleSheet()
+        bg = _qss_color(qss, "QPushButton:disabled")
+        fg = _qss_color(qss, "QPushButton:disabled", "color")
+        self.assertLess(abs(bg.lightness() - win_bg.lightness()), 60,
+                        f"disabled {bg.name()} vs window {win_bg.name()}")
+        self.assertGreaterEqual(_contrast(fg, bg), 3.0)
+
+    def _assert_log_follows_theme(self):
+        bg = _qss_color(self.win.log_text.styleSheet(), "QTextEdit")
+        base = self.win.palette().color(QPalette.ColorRole.Base)
+        self.assertEqual(bg.name(), base.name())
+
+    def test_light_buttons_and_log(self):
+        self._assert_buttons_legible()
+        self._assert_log_follows_theme()
+
+    def test_dark_buttons_and_log(self):
+        original = QApplication.palette()
+        try:
+            QApplication.setPalette(_dark_palette())
+            QApplication.processEvents()
+            self._assert_buttons_legible()
+            self._assert_log_follows_theme()
+        finally:
+            QApplication.setPalette(original)
 
     def test_dark_theme(self):
         original = QApplication.palette()
