@@ -1,7 +1,7 @@
 import os
 import subprocess
 
-from PyQt6.QtCore import Qt, QSettings
+from PyQt6.QtCore import Qt, QSettings, QEvent
 from PyQt6.QtGui import QFont, QColor, QPalette
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -14,6 +14,17 @@ from pipeline.worker import ProcessingWorker, load_saved_transcript
 from pipeline.ytdlp_health import staleness_warning
 from ui.secure_store import load_secret, save_secret
 from version import __version__
+
+
+# Semantic text colours per theme. Each clears WCAG AA (4.5:1) against both
+# the window and the slightly darker group-box background, which the old
+# fixed hex values (#888, #aaa, #34a853, and #ffffff on a light window) did not.
+_TONES = {
+    "light": {"muted": "#5f6368", "success": "#137333", "info": "#185abc",
+              "warning": "#a14f00", "error": "#c5221f"},
+    "dark":  {"muted": "#a8adb3", "success": "#81c995", "info": "#8ab4f8",
+              "warning": "#fbbc5e", "error": "#f28b82"},
+}
 
 
 def _elide_middle(text: str, head: int = 15, tail: int = 10) -> str:
@@ -33,11 +44,43 @@ class MainWindow(QMainWindow):
         self._local_file = ""
         self._out_path = ""
         self._current_stage = 1
+        self._cancel_requested = False
+        self._run_finished = False
         self._total_stages = len(ProcessingWorker.STAGES)
         self._settings = QSettings("AutoNotes", "AutoNotes")
         self._build_ui()
         self._load_settings()
         self._warn_if_ytdlp_stale()
+
+    # ── Theming ──────────────────────────────────────────────────────────
+
+    def _is_dark(self) -> bool:
+        return self.palette().color(QPalette.ColorRole.Window).lightness() < 128
+
+    def _set_tone(self, lbl: QLabel, tone: str = "", size: int = 11, bold: bool = False):
+        """Style a label by meaning, not colour, so it can be re-coloured when
+        the system theme flips. An empty tone inherits the palette's text colour."""
+        lbl.setProperty("tone", tone)
+        lbl.setProperty("tone_size", size)
+        lbl.setProperty("tone_bold", bold)
+        style = f"font-size: {size}px;"
+        if tone:
+            style += f" color: {_TONES['dark' if self._is_dark() else 'light'][tone]};"
+        if bold:
+            style += " font-weight: bold;"
+        lbl.setStyleSheet(style)
+
+    def _restyle(self):
+        for lbl in self.findChildren(QLabel):
+            if lbl.property("tone") is not None:
+                self._set_tone(lbl, lbl.property("tone"),
+                               lbl.property("tone_size"), lbl.property("tone_bold"))
+
+    def changeEvent(self, event):
+        if event.type() in (QEvent.Type.PaletteChange,
+                            QEvent.Type.ApplicationPaletteChange):
+            self._restyle()
+        super().changeEvent(event)
 
     # ── UI Construction ──────────────────────────────────────────────────
 
@@ -56,7 +99,7 @@ class MainWindow(QMainWindow):
 
         subtitle = QLabel(f"AI-powered video notes with screenshots  ·  v{__version__}")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle.setStyleSheet("color: #666; font-size: 12px;")
+        self._set_tone(subtitle, "muted", 12)
         root.addWidget(subtitle)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -90,12 +133,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.url_edit)
 
         self.input_status = QLabel("")
-        self.input_status.setStyleSheet("color: #1a73e8; font-size: 11px;")
+        self._set_tone(self.input_status, "info")
         layout.addWidget(self.input_status)
 
         row = QHBoxLayout()
         self.file_path_label = QLabel("No file selected")
-        self.file_path_label.setStyleSheet("color: #888; font-size: 11px;")
+        self._set_tone(self.file_path_label, "muted")
         self.file_path_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         row.addWidget(self.file_path_label)
 
@@ -131,19 +174,20 @@ class MainWindow(QMainWindow):
         hint = QLabel(
             "tiny/base = fast, lower accuracy  ·  large-v3 = best, slow on CPU"
         )
-        hint.setStyleSheet("color: #888; font-size: 10px;")
+        self._set_tone(hint, "muted", 10)
         form.addRow("", hint)
 
         self.reuse_transcript_check = QCheckBox("Reuse last transcript (skip transcription)")
         form.addRow("", self.reuse_transcript_check)
 
         self.reuse_info_label = QLabel("")
-        self.reuse_info_label.setStyleSheet("color: #888; font-size: 10px;")
+        self._set_tone(self.reuse_info_label, "muted", 10)
         form.addRow("", self.reuse_info_label)
 
         # ── Microsoft Teams / Graph API (optional) ────────────────────────
         teams_header = QLabel("Microsoft Teams (optional)")
-        teams_header.setStyleSheet("color: #aaa; font-size: 10px; font-weight: bold; margin-top: 6px;")
+        self._set_tone(teams_header, "muted", 10, bold=True)
+        teams_header.setContentsMargins(0, 6, 0, 0)
         form.addRow("", teams_header)
 
         self.ms_client_id_edit = QLineEdit()
@@ -155,7 +199,7 @@ class MainWindow(QMainWindow):
         form.addRow("Join URL:", self.ms_join_url_edit)
 
         ms_hint = QLabel("Leave blank to use recording URL only (transcript still comes from the recording)")
-        ms_hint.setStyleSheet("color: #888; font-size: 10px;")
+        self._set_tone(ms_hint, "muted", 10)
         form.addRow("", ms_hint)
 
         return box
@@ -193,7 +237,7 @@ class MainWindow(QMainWindow):
 
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setFixedHeight(40)
-        self.cancel_btn.setFixedWidth(90)
+        self.cancel_btn.setMinimumWidth(90)
         self.cancel_btn.setVisible(False)
         self.cancel_btn.clicked.connect(self._cancel_processing)
         row.addWidget(self.cancel_btn)
@@ -238,6 +282,12 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
 
+        # One-line outcome so a failure or cancel isn't only visible in the log
+        self.run_status = QLabel("")
+        self.run_status.setWordWrap(True)
+        self._set_tone(self.run_status, "", 12, bold=True)
+        layout.addWidget(self.run_status)
+
         # Log
         log_label = QLabel("Log")
         log_label.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
@@ -265,19 +315,39 @@ class MainWindow(QMainWindow):
     # ── Slots ────────────────────────────────────────────────────────────
 
     def _on_input_changed(self):
+        # A typed URL replaces a browsed file; otherwise the stale file name
+        # stays on screen while _start_processing silently uses the URL
+        if self.url_edit.text().strip() and self._local_file:
+            self._set_local_file("")
+
         has_input = bool(self.url_edit.text().strip()) or bool(self._local_file)
         has_key = bool(self.api_key_edit.text().strip())
         ready = has_input and has_key
-        self.process_btn.setEnabled(ready)
+        if not self._is_running():
+            self.process_btn.setEnabled(ready)
 
         if ready:
             self.input_status.setText("Ready — click Generate Notes to start")
-            self.input_status.setStyleSheet("color: #34a853; font-size: 11px;")
+            self._set_tone(self.input_status, "success")
         elif has_input and not has_key:
             self.input_status.setText("Enter your Claude API key to continue")
-            self.input_status.setStyleSheet("color: #e8710a; font-size: 11px;")
+            self._set_tone(self.input_status, "warning")
         else:
             self.input_status.setText("")
+
+    def _is_running(self) -> bool:
+        return bool(self._worker and self._worker.isRunning())
+
+    def _set_local_file(self, path: str):
+        self._local_file = path
+        if path:
+            self.file_path_label.setText(os.path.basename(path))
+            self.file_path_label.setToolTip(path)
+            self._set_tone(self.file_path_label, "")
+        else:
+            self.file_path_label.setText("No file selected")
+            self.file_path_label.setToolTip("")
+            self._set_tone(self.file_path_label, "muted")
 
     def _browse_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -285,11 +355,10 @@ class MainWindow(QMainWindow):
             "Video files (*.mp4 *.mpeg *.mpg *.mov *.avi *.mkv);;All files (*)"
         )
         if path:
-            self._local_file = path
+            # Clear the URL first: its textChanged must not see the new file
             self.url_edit.clear()
-            self.file_path_label.setText(os.path.basename(path))
-            self.file_path_label.setStyleSheet("color: #ffffff; font-size: 11px;")
-            self.process_btn.setEnabled(bool(self.api_key_edit.text().strip()))
+            self._set_local_file(path)
+            self._on_input_changed()
 
     def _browse_output_dir(self):
         d = QFileDialog.getExistingDirectory(
@@ -329,7 +398,6 @@ class MainWindow(QMainWindow):
         self.open_btn.setVisible(False)
 
         self._worker.start()
-        self.file_path_label.setStyleSheet("color: #1a73e8; font-size: 11px;")
 
     def _cancel_processing(self):
         if self._worker and self._worker.isRunning():
@@ -339,18 +407,24 @@ class MainWindow(QMainWindow):
             self.cancel_btn.setEnabled(False)
             self.cancel_btn.setText("Cancelling…")
             self._on_log("Cancelling — waiting for current step to stop…")
-        self.file_path_label.setStyleSheet("color: #ffffff; font-size: 11px;")
+            self._cancel_requested = True
+
+    _STAGE_LOOK = {
+        "done":      ("✓", "success", False),
+        "active":    ("▶", "info", True),
+        "failed":    ("✕", "error", True),
+        "cancelled": ("■", "warning", True),
+        "pending":   ("○", "muted", False),
+    }
 
     def _render_stage(self, lbl: QLabel, name: str, state: str):
-        if state == "done":
-            lbl.setText(f"✓  {name}")
-            lbl.setStyleSheet("color: #34a853; font-size: 12px;")
-        elif state == "active":
-            lbl.setText(f"▶  {name}")
-            lbl.setStyleSheet("color: #1a73e8; font-size: 12px; font-weight: bold;")
-        else:
-            lbl.setText(f"○  {name}")
-            lbl.setStyleSheet("color: #999; font-size: 12px;")
+        glyph, tone, bold = self._STAGE_LOOK[state]
+        lbl.setText(f"{glyph}  {name}")
+        self._set_tone(lbl, tone, 12, bold)
+
+    def _set_run_status(self, text: str, tone: str = ""):
+        self.run_status.setText(text)
+        self._set_tone(self.run_status, tone, 12, bold=True)
 
     def _on_stage_changed(self, label: str, current: int, total: int):
         self._current_stage = current
@@ -388,14 +462,25 @@ class MainWindow(QMainWindow):
             self._render_stage(lbl, self._stage_names[i], "done")
         self.progress_bar.setValue(100)
 
-        self.file_path_label.setStyleSheet("color: #34a853; font-size: 11px;")
         self._out_path = out_path
+        self._run_finished = True
+        self._set_run_status(f"Done — saved {os.path.basename(out_path)}", "success")
         self.open_btn.setVisible(True)
 
     def _on_error(self, msg: str):
         self._on_log(f"\nERROR: {msg}")
+        self._run_finished = True
+        idx = self._current_stage - 1
+        self._render_stage(self.stage_labels[idx], self._stage_names[idx], "failed")
+        self.progress_bar.setFormat(f"Failed at stage {self._current_stage}")
+        self._set_run_status(f"Failed: {msg}", "error")
 
     def _set_idle(self):
+        if self._cancel_requested and not self._run_finished:
+            idx = self._current_stage - 1
+            self._render_stage(self.stage_labels[idx], self._stage_names[idx], "cancelled")
+            self.progress_bar.setFormat("Cancelled")
+            self._set_run_status("Cancelled", "warning")
         self.cancel_btn.setVisible(False)
         self.cancel_btn.setEnabled(True)
         self.cancel_btn.setText("Cancel")
@@ -427,7 +512,11 @@ class MainWindow(QMainWindow):
         for i, lbl in enumerate(self.stage_labels):
             self._render_stage(lbl, self._stage_names[i], "pending")
         self._current_stage = 1
+        self._cancel_requested = False
+        self._run_finished = False
         self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
+        self._set_run_status("")
         self.log_text.clear()
         self.open_btn.setVisible(False)
 
