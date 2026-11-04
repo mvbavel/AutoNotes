@@ -1,10 +1,12 @@
 import os
 import subprocess
+import time
+from datetime import datetime
 
-from PyQt6.QtCore import Qt, QSettings, QEvent
-from PyQt6.QtGui import QFont, QColor, QPalette
+from PyQt6.QtCore import Qt, QSettings, QEvent, QPointF, QRectF, QTimer
+from PyQt6.QtGui import QFont, QColor, QPalette, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QFileDialog,
     QComboBox, QTextEdit, QProgressBar, QGroupBox,
     QFormLayout, QSplitter, QFrame, QSizePolicy, QCheckBox,
@@ -12,6 +14,7 @@ from PyQt6.QtWidgets import (
 
 from pipeline.worker import ProcessingWorker, load_saved_transcript
 from pipeline.ytdlp_health import staleness_warning
+from ui.messages import explain_error, format_duration
 from ui.secure_store import load_secret, save_secret
 from version import __version__
 
@@ -27,12 +30,84 @@ _TONES = {
 }
 
 
+# (row label, what's under way, for "Something went wrong while …")
+_STAGES = [
+    ("Download recording", "downloading the recording"),
+    ("Extract audio", "extracting audio"),
+    ("Transcribe speech", "transcribing speech"),
+    ("Identify speakers", "identifying speakers"),
+    ("Pick screenshots", "picking screenshots"),
+    ("Write notes with Claude", "writing notes with Claude"),
+    ("Build document", "building the document"),
+]
+
+# Whisper model sizes behind plain-language labels; the model name stays
+# visible because people who know Whisper will look for it
+_QUALITY = [
+    ("Fastest (tiny)", "tiny"),
+    ("Fast (base)", "base"),
+    ("Balanced (small)", "small"),
+    ("Accurate (medium)", "medium"),
+    ("Most accurate (large-v3)", "large-v3"),
+]
+
+# state -> (icon colour tone, name tone, name bold)
+_STAGE_LOOK = {
+    "pending":   ("muted", "muted", False),
+    "active":    ("info", "", True),
+    "done":      ("success", "", False),
+    "skipped":   ("muted", "muted", False),
+    "failed":    ("error", "error", True),
+    "cancelled": ("warning", "warning", True),
+}
+
+_ICON_PX = 14
+
+
+def _stage_icon(state: str, color: QColor, dpr: float) -> QPixmap:
+    """Draw the row marker. Text glyphs (✓ ▶ ✕ ○) come from different fallback
+    fonts on macOS and render at visibly different sizes, so paint them."""
+    pm = QPixmap(int(_ICON_PX * dpr), int(_ICON_PX * dpr))
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(QPen(color, 1.6, cap=Qt.PenCapStyle.RoundCap, join=Qt.PenJoinStyle.RoundJoin))
+    c, r = _ICON_PX / 2, _ICON_PX / 2 - 1.5
+    if state in ("pending", "active"):
+        p.drawEllipse(QPointF(c, c), r, r)
+        if state == "active":
+            p.setBrush(color)
+            p.drawEllipse(QPointF(c, c), r / 2.2, r / 2.2)
+    elif state == "done":
+        p.drawPolyline([QPointF(3, 7.5), QPointF(6, 10.5), QPointF(11, 4)])
+    elif state == "skipped":
+        p.drawLine(QPointF(3.5, c), QPointF(10.5, c))
+    elif state == "failed":
+        p.drawLine(QPointF(4, 4), QPointF(10, 10))
+        p.drawLine(QPointF(10, 4), QPointF(4, 10))
+    elif state == "cancelled":
+        p.setBrush(color)
+        p.drawRect(QRectF(4, 4, 6, 6))
+    p.end()
+    return pm
+
+
 def _elide_middle(text: str, head: int = 15, tail: int = 10) -> str:
     """Shorten a long string to 'first head…last tail' so the info label
     doesn't force the config panel wide. Short strings are left as-is."""
     if len(text) <= head + tail + 1:
         return text
     return f"{text[:head]}…{text[-tail:]}"
+
+
+def _friendly_time(iso: str) -> str:
+    """'2026-11-03T15:14:05' -> '3 Nov 15:14'; unparseable values pass through."""
+    try:
+        t = datetime.fromisoformat(iso)
+    except ValueError:
+        return iso
+    return f"{t.day} {t:%b %H:%M}"
 
 
 class MainWindow(QMainWindow):
@@ -46,6 +121,17 @@ class MainWindow(QMainWindow):
         self._current_stage = 1
         self._cancel_requested = False
         self._run_finished = False
+        self._run_started = 0.0
+        self._stage_states = ["pending"] * len(_STAGES)
+        self._stage_facts = [""] * len(_STAGES)
+        self._stage_skipped = [False] * len(_STAGES)
+        self._stage_started = [0.0] * len(_STAGES)
+        self._stage_elapsed = [0.0] * len(_STAGES)
+        self._stage_pct = 0
+        # Ticks the active row's elapsed time; runs only while a stage is active
+        self._clock = QTimer(self)
+        self._clock.setInterval(1000)
+        self._clock.timeout.connect(self._tick)
         self._total_stages = len(ProcessingWorker.STAGES)
         self._settings = QSettings("AutoNotes", "AutoNotes")
         self._build_ui()
@@ -80,6 +166,9 @@ class MainWindow(QMainWindow):
         if event.type() in (QEvent.Type.PaletteChange,
                             QEvent.Type.ApplicationPaletteChange):
             self._restyle()
+            # Icons are pixmaps, so they don't follow the label tones on their own
+            if hasattr(self, "stage_icons"):
+                self._render_stages()
         super().changeEvent(event)
 
     # ── UI Construction ──────────────────────────────────────────────────
@@ -97,7 +186,8 @@ class MainWindow(QMainWindow):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(title)
 
-        subtitle = QLabel(f"AI-powered video notes with screenshots  ·  v{__version__}")
+        subtitle = QLabel("Turns a meeting recording into Word notes with screenshots. "
+                          f"Version {__version__}")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._set_tone(subtitle, "muted", 12)
         root.addWidget(subtitle)
@@ -124,11 +214,11 @@ class MainWindow(QMainWindow):
         return panel
 
     def _build_input_group(self) -> QGroupBox:
-        box = QGroupBox("Video Input")
+        box = QGroupBox("Recording")
         layout = QVBoxLayout(box)
 
         self.url_edit = QLineEdit()
-        self.url_edit.setPlaceholderText("Paste YouTube URL, Teams recording URL, or SharePoint URL  —  or browse for a local file")
+        self.url_edit.setPlaceholderText("Paste a Teams, SharePoint or YouTube link, or browse for a video file")
         self.url_edit.textChanged.connect(self._on_input_changed)
         layout.addWidget(self.url_edit)
 
@@ -151,7 +241,7 @@ class MainWindow(QMainWindow):
         return box
 
     def _build_config_group(self) -> QGroupBox:
-        box = QGroupBox("Configuration")
+        box = QGroupBox("Settings")
         form = QFormLayout(box)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
@@ -159,25 +249,24 @@ class MainWindow(QMainWindow):
         self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key_edit.setPlaceholderText("sk-ant-…")
         self.api_key_edit.textChanged.connect(self._on_input_changed)
-        form.addRow("Claude API Key:", self.api_key_edit)
+        form.addRow("Claude API key:", self.api_key_edit)
 
         self.hf_token_edit = QLineEdit()
         self.hf_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.hf_token_edit.setPlaceholderText("hf_… (optional — enables speaker ID)")
-        form.addRow("HuggingFace Token:", self.hf_token_edit)
+        self.hf_token_edit.setPlaceholderText("Hugging Face token, optional")
+        form.addRow("Speaker names:", self.hf_token_edit)
 
         self.model_combo = QComboBox()
-        self.model_combo.addItems(["tiny", "base", "small", "medium", "large-v3"])
-        self.model_combo.setCurrentText("medium")
-        form.addRow("Whisper Model:", self.model_combo)
+        for label, model in _QUALITY:
+            self.model_combo.addItem(label, model)
+        self._select_model("medium")
+        form.addRow("Transcription:", self.model_combo)
 
-        hint = QLabel(
-            "tiny/base = fast, lower accuracy  ·  large-v3 = best, slow on CPU"
-        )
+        hint = QLabel("More accurate transcription takes longer on this Mac.")
         self._set_tone(hint, "muted", 10)
         form.addRow("", hint)
 
-        self.reuse_transcript_check = QCheckBox("Reuse last transcript (skip transcription)")
+        self.reuse_transcript_check = QCheckBox("Reuse the last transcript instead of transcribing")
         form.addRow("", self.reuse_transcript_check)
 
         self.reuse_info_label = QLabel("")
@@ -191,21 +280,22 @@ class MainWindow(QMainWindow):
         form.addRow("", teams_header)
 
         self.ms_client_id_edit = QLineEdit()
-        self.ms_client_id_edit.setPlaceholderText("Azure app Client ID (for attendees and AI notes)")
-        form.addRow("MS Client ID:", self.ms_client_id_edit)
+        self.ms_client_id_edit.setPlaceholderText("Azure app client ID")
+        form.addRow("MS client ID:", self.ms_client_id_edit)
 
         self.ms_join_url_edit = QLineEdit()
-        self.ms_join_url_edit.setPlaceholderText("Teams meeting Join URL (from calendar invite — enables full metadata)")
-        form.addRow("Join URL:", self.ms_join_url_edit)
+        self.ms_join_url_edit.setPlaceholderText("Join link from the meeting's calendar invite")
+        form.addRow("Join link:", self.ms_join_url_edit)
 
-        ms_hint = QLabel("Leave blank to use recording URL only (transcript still comes from the recording)")
+        ms_hint = QLabel("Both add attendees and the Teams recap. "
+                         "The transcript comes from the recording either way.")
         self._set_tone(ms_hint, "muted", 10)
         form.addRow("", ms_hint)
 
         return box
 
     def _build_output_group(self) -> QGroupBox:
-        box = QGroupBox("Output")
+        box = QGroupBox("Save to")
         row = QHBoxLayout(box)
 
         self.output_dir_edit = QLineEdit()
@@ -252,24 +342,28 @@ class MainWindow(QMainWindow):
 
         # Stage indicators
         stages_box = QGroupBox("Progress")
-        stages_layout = QVBoxLayout(stages_box)
-        stages_layout.setSpacing(4)
+        grid = QGridLayout(stages_box)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+        grid.setColumnStretch(2, 1)
 
+        self._stage_names = [name for name, _ in _STAGES]
+        self.stage_icons: list[QLabel] = []
         self.stage_labels: list[QLabel] = []
-        self._stage_names = [
-            "Download / load video",
-            "Extract audio",
-            "Transcribe speech",
-            "Identify speakers",
-            "Extract screenshots",
-            "Generate AI notes",
-            "Write document",
-        ]
-        for name in self._stage_names:
-            lbl = QLabel()
-            stages_layout.addWidget(lbl)
+        self.stage_details: list[QLabel] = []
+        for row, name in enumerate(self._stage_names):
+            icon, lbl, detail = QLabel(), QLabel(name), QLabel("")
+            icon.setFixedSize(_ICON_PX, _ICON_PX)
+            detail.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            # Long facts (file names) must not widen the panel
+            detail.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            grid.addWidget(icon, row, 0, Qt.AlignmentFlag.AlignVCenter)
+            grid.addWidget(lbl, row, 1)
+            grid.addWidget(detail, row, 2)
+            self.stage_icons.append(icon)
             self.stage_labels.append(lbl)
-            self._render_stage(lbl, name, "pending")
+            self.stage_details.append(detail)
+        self._render_stages()
 
         layout.addWidget(stages_box)
 
@@ -300,7 +394,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.log_text, stretch=1)
 
         # Open output button
-        self.open_btn = QPushButton("Open Document")
+        self.open_btn = QPushButton("Open Notes")
         self.open_btn.setFixedHeight(38)
         self.open_btn.setVisible(False)
         self.open_btn.setStyleSheet(
@@ -327,10 +421,10 @@ class MainWindow(QMainWindow):
             self.process_btn.setEnabled(ready)
 
         if ready:
-            self.input_status.setText("Ready — click Generate Notes to start")
+            self.input_status.setText("Ready to generate notes.")
             self._set_tone(self.input_status, "success")
         elif has_input and not has_key:
-            self.input_status.setText("Enter your Claude API key to continue")
+            self.input_status.setText("Add your Claude API key to continue.")
             self._set_tone(self.input_status, "warning")
         else:
             self.input_status.setText("")
@@ -377,7 +471,7 @@ class MainWindow(QMainWindow):
         config = {
             "anthropic_key": self.api_key_edit.text().strip(),
             "hf_token": self.hf_token_edit.text().strip(),
-            "whisper_model": self.model_combo.currentText(),
+            "whisper_model": self.model_combo.currentData(),
             "reuse_transcript": self.reuse_transcript_check.isChecked(),
             "output_dir": self.output_dir_edit.text().strip() or os.path.expanduser("~/Desktop"),
             "ms_client_id": self.ms_client_id_edit.text().strip(),
@@ -387,6 +481,7 @@ class MainWindow(QMainWindow):
         self._worker = ProcessingWorker(source, config)
         self._worker.stage_changed.connect(self._on_stage_changed)
         self._worker.stage_progress.connect(self._on_stage_progress)
+        self._worker.stage_detail.connect(self._on_stage_detail)
         self._worker.log_message.connect(self._on_log)
         self._worker.completed.connect(self._on_completed)
         self._worker.error.connect(self._on_error)
@@ -397,6 +492,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(True)
         self.open_btn.setVisible(False)
 
+        self._run_started = time.monotonic()
+        self._clock.start()
         self._worker.start()
 
     def _cancel_processing(self):
@@ -409,32 +506,59 @@ class MainWindow(QMainWindow):
             self._on_log("Cancelling — waiting for current step to stop…")
             self._cancel_requested = True
 
-    _STAGE_LOOK = {
-        "done":      ("✓", "success", False),
-        "active":    ("▶", "info", True),
-        "failed":    ("✕", "error", True),
-        "cancelled": ("■", "warning", True),
-        "pending":   ("○", "muted", False),
-    }
+    def _render_stages(self):
+        dpr = self.devicePixelRatioF() or 1.0
+        palette = _TONES["dark" if self._is_dark() else "light"]
+        for i, state in enumerate(self._stage_states):
+            icon_tone, name_tone, bold = _STAGE_LOOK[state]
+            self.stage_icons[i].setPixmap(
+                _stage_icon(state, QColor(palette[icon_tone]), dpr))
+            self._set_tone(self.stage_labels[i], name_tone, 12, bold)
+            self.stage_details[i].setText(self._stage_detail_text(i))
+            self.stage_details[i].setToolTip(self._stage_facts[i])
+            self._set_tone(self.stage_details[i], "muted", 11)
 
-    def _render_stage(self, lbl: QLabel, name: str, state: str):
-        glyph, tone, bold = self._STAGE_LOOK[state]
-        lbl.setText(f"{glyph}  {name}")
-        self._set_tone(lbl, tone, 12, bold)
+    def _stage_detail_text(self, i: int) -> str:
+        """Right-hand fact for a row: what it produced, and how long it took."""
+        state, fact = self._stage_states[i], self._stage_facts[i]
+        if state == "pending":
+            return ""
+        if state == "skipped":
+            return fact
+        if state == "active":
+            elapsed = time.monotonic() - self._stage_started[i]
+            parts = [fact] if fact else []
+            if 0 < self._stage_pct < 100:
+                parts.append(f"{self._stage_pct}%")
+            parts.append(format_duration(elapsed))
+            return ", ".join(parts)
+        if self._stage_elapsed[i] < 1:
+            return fact  # "0s" on instant stages is noise
+        elapsed = format_duration(self._stage_elapsed[i])
+        return f"{fact}, {elapsed}" if fact else elapsed
 
     def _set_run_status(self, text: str, tone: str = ""):
         self.run_status.setText(text)
         self._set_tone(self.run_status, tone, 12, bold=True)
 
+    def _close_stage(self, i: int, outcome: str):
+        """Finish row i: freeze its time and settle its final state."""
+        if self._stage_states[i] == "active":
+            self._stage_elapsed[i] = time.monotonic() - self._stage_started[i]
+        if outcome == "done" and self._stage_skipped[i]:
+            outcome = "skipped"
+        self._stage_states[i] = outcome
+
     def _on_stage_changed(self, label: str, current: int, total: int):
         self._current_stage = current
         self._total_stages = total
-        for i, lbl in enumerate(self.stage_labels):
-            stage_n = i + 1
-            state = ("done" if stage_n < current
-                     else "active" if stage_n == current
-                     else "pending")
-            self._render_stage(lbl, self._stage_names[i], state)
+        for i in range(len(self._stage_states)):
+            if i < current - 1 and self._stage_states[i] in ("pending", "active"):
+                self._close_stage(i, "done")
+        self._stage_states[current - 1] = "active"
+        self._stage_started[current - 1] = time.monotonic()
+        self._stage_pct = 0
+        self._render_stages()
 
         self.progress_bar.setValue(int(((current - 1) / total) * 100))
 
@@ -442,6 +566,20 @@ class MainWindow(QMainWindow):
         # Overall = completed stages + fractional progress of the current one
         overall = int(((self._current_stage - 1) + pct / 100) / self._total_stages * 100)
         self.progress_bar.setValue(max(self.progress_bar.value(), overall))
+        self._stage_pct = pct
+        idx = self._current_stage - 1
+        self.stage_details[idx].setText(self._stage_detail_text(idx))
+
+    def _on_stage_detail(self, stage: int, text: str, skipped: bool):
+        i = stage - 1
+        self._stage_facts[i] = text
+        self._stage_skipped[i] = skipped
+        self._render_stages()
+
+    def _tick(self):
+        idx = self._current_stage - 1
+        if self._stage_states[idx] == "active":
+            self.stage_details[idx].setText(self._stage_detail_text(idx))
 
     def _warn_if_ytdlp_stale(self):
         """Flag an aged-out yt-dlp at launch rather than mid-download.
@@ -458,29 +596,38 @@ class MainWindow(QMainWindow):
 
     def _on_completed(self, out_path: str):
         self._on_log(f"\nDone! Output: {out_path}")
-        for i, lbl in enumerate(self.stage_labels):
-            self._render_stage(lbl, self._stage_names[i], "done")
+        for i in range(len(self._stage_states)):
+            self._close_stage(i, "done")
+        self._render_stages()
         self.progress_bar.setValue(100)
 
         self._out_path = out_path
         self._run_finished = True
-        self._set_run_status(f"Done — saved {os.path.basename(out_path)}", "success")
+        took = format_duration(time.monotonic() - self._run_started) if self._run_started else ""
+        self._set_run_status(
+            f"Notes saved as {os.path.basename(out_path)}" + (f" in {took}." if took else "."),
+            "success")
         self.open_btn.setVisible(True)
 
     def _on_error(self, msg: str):
         self._on_log(f"\nERROR: {msg}")
         self._run_finished = True
         idx = self._current_stage - 1
-        self._render_stage(self.stage_labels[idx], self._stage_names[idx], "failed")
-        self.progress_bar.setFormat(f"Failed at stage {self._current_stage}")
-        self._set_run_status(f"Failed: {msg}", "error")
+        self._close_stage(idx, "failed")
+        self._render_stages()
+        self.progress_bar.setFormat("Stopped")
+        self._set_run_status(explain_error(msg, _STAGES[idx][1]), "error")
+        # The raw error stays reachable without being the headline
+        self.run_status.setToolTip(msg)
 
     def _set_idle(self):
+        self._clock.stop()
         if self._cancel_requested and not self._run_finished:
             idx = self._current_stage - 1
-            self._render_stage(self.stage_labels[idx], self._stage_names[idx], "cancelled")
+            self._close_stage(idx, "cancelled")
+            self._render_stages()
             self.progress_bar.setFormat("Cancelled")
-            self._set_run_status("Cancelled", "warning")
+            self._set_run_status("Cancelled. Nothing was saved.", "warning")
         self.cancel_btn.setVisible(False)
         self.cancel_btn.setEnabled(True)
         self.cancel_btn.setText("Cancel")
@@ -493,12 +640,11 @@ class MainWindow(QMainWindow):
         segments, meta = load_saved_transcript()
         if segments:
             src = meta.get("video", "")
-            saved = meta.get("saved", "").replace("T", " ")
             detail = f"'{_elide_middle(src)}', " if src else ""
-            when = f", saved {saved}" if saved else ""
+            when = f", saved {_friendly_time(meta.get('saved', ''))}" if meta.get("saved") else ""
             self.reuse_transcript_check.setEnabled(True)
             self.reuse_info_label.setText(
-                f"Available: {detail}{len(segments)} segments{when}")
+                f"Last transcript: {detail}{len(segments):,} lines{when}")
             # Full title on hover, since the display is elided
             self.reuse_info_label.setToolTip(src)
         else:
@@ -506,11 +652,17 @@ class MainWindow(QMainWindow):
             self.reuse_transcript_check.setChecked(False)
             self.reuse_info_label.setToolTip("")
             self.reuse_info_label.setText(
-                "No saved transcript yet — one is kept after each transcription")
+                "No saved transcript yet. One is kept after each transcription.")
 
     def _reset_progress(self):
-        for i, lbl in enumerate(self.stage_labels):
-            self._render_stage(lbl, self._stage_names[i], "pending")
+        n = len(_STAGES)
+        self._stage_states = ["pending"] * n
+        self._stage_facts = [""] * n
+        self._stage_skipped = [False] * n
+        self._stage_elapsed = [0.0] * n
+        self._stage_pct = 0
+        self._render_stages()
+        self.run_status.setToolTip("")
         self._current_stage = 1
         self._cancel_requested = False
         self._run_finished = False
@@ -519,6 +671,11 @@ class MainWindow(QMainWindow):
         self._set_run_status("")
         self.log_text.clear()
         self.open_btn.setVisible(False)
+
+    def _select_model(self, model: str):
+        idx = self.model_combo.findData(model)
+        if idx >= 0:
+            self.model_combo.setCurrentIndex(idx)
 
     def _open_output(self):
         if self._out_path:
@@ -530,7 +687,7 @@ class MainWindow(QMainWindow):
         s = self._settings
         save_secret(s, "api_key", self.api_key_edit.text())
         save_secret(s, "hf_token", self.hf_token_edit.text())
-        s.setValue("whisper_model", self.model_combo.currentText())
+        s.setValue("whisper_model", self.model_combo.currentData())
         s.setValue("output_dir", self.output_dir_edit.text())
         s.setValue("ms_client_id", self.ms_client_id_edit.text())
         s.setValue("ms_join_url", self.ms_join_url_edit.text())
@@ -539,10 +696,7 @@ class MainWindow(QMainWindow):
         s = self._settings
         self.api_key_edit.setText(load_secret(s, "api_key"))
         self.hf_token_edit.setText(load_secret(s, "hf_token"))
-        model = s.value("whisper_model", "medium")
-        idx = self.model_combo.findText(model)
-        if idx >= 0:
-            self.model_combo.setCurrentIndex(idx)
+        self._select_model(s.value("whisper_model", "medium"))
         self.output_dir_edit.setText(s.value("output_dir", ""))
         self.ms_client_id_edit.setText(s.value("ms_client_id", ""))
         self.ms_join_url_edit.setText(s.value("ms_join_url", ""))

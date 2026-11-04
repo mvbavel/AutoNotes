@@ -24,6 +24,7 @@ DEBUG_DIR = os.path.expanduser("~/Library/Logs/AutoNotes")
 class ProcessingWorker(QThread):
     stage_changed = pyqtSignal(str, int, int)   # label, current (1-based), total
     stage_progress = pyqtSignal(int)            # 0-100 within current stage
+    stage_detail = pyqtSignal(int, str, bool)   # stage (1-based), one-line fact, skipped
     log_message = pyqtSignal(str)
     completed = pyqtSignal(str)                 # output file path
     error = pyqtSignal(str)
@@ -133,14 +134,17 @@ class ProcessingWorker(QThread):
 
         self._log(f"Video: {title}")
         safe_title = safe_filename(title)
+        self._detail(1, source_type + (", transcript included" if pre_segments else ""))
 
         # Optional: reuse the transcript saved by a previous run (skips audio
         # extraction, Whisper, and diarization). A transcript that came with
         # the download (Teams VTT / Graph) still takes priority.
+        transcript_origin = "From the Teams recording" if pre_segments else None
         if self.config.get("reuse_transcript") and pre_segments is None:
             saved_segments, meta = load_saved_transcript()
             if saved_segments:
                 pre_segments = saved_segments
+                transcript_origin = "Reused from last run"
                 src = meta.get("video", "")
                 self._log(f"Reusing saved transcript ({len(saved_segments)} segments"
                           + (f", from '{src}'" if src else "") + ")")
@@ -155,14 +159,17 @@ class ProcessingWorker(QThread):
         if pre_segments is not None:
             self._log(f"Transcript available ({len(pre_segments)} segments) — skipping audio extraction")
             self._progress(100)
+            self._detail(2, "Not needed, transcript available", skipped=True)
             audio_path = None
         elif is_url:
             # Check for yt-dlp downloaded SRT (YouTube)
             srt_segs = find_transcript(temp_dir)
             if srt_segs:
                 pre_segments = srt_segs
+                transcript_origin = "From YouTube captions"
                 self._log(f"YouTube transcript found: {len(pre_segments)} segments — skipping audio extraction")
                 self._progress(100)
+                self._detail(2, "Not needed, captions available", skipped=True)
                 audio_path = None
             else:
                 self._log("No transcript available — extracting audio…")
@@ -181,6 +188,7 @@ class ProcessingWorker(QThread):
             segments = pre_segments
             self._log(f"Using pre-existing transcript ({len(segments)} segments) — skipping Whisper")
             self._progress(100)
+            self._detail(3, f"{transcript_origin}, {_lines(segments)}", skipped=True)
         else:
             model = self.config.get("whisper_model", "medium")
             self._log(f"Transcribing with Whisper ({model})… (this may take a while)")
@@ -189,6 +197,7 @@ class ProcessingWorker(QThread):
                                   cancel_check=self._check_cancel,
                                   log_cb=self._log)
             self._log(f"Transcription: {len(segments)} segments")
+            self._detail(3, _lines(segments))
 
         # ── Stage 4: Speaker diarization ──────────────────────────────────
         self._stage(4, total)
@@ -196,14 +205,19 @@ class ProcessingWorker(QThread):
         if pre_segments is not None:
             self._log("Skipping speaker diarization (transcript already has speaker labels)")
             self._progress(100)
+            self._detail(4, "Not needed with an existing transcript", skipped=True)
         elif hf_token:
             self._log("Identifying speakers with pyannote…")
             segments = diarize(audio_path, segments, hf_token,
                                progress_cb=self._progress, log_cb=self._log)
+            speakers = {s.get("speaker") for s in segments} - {None, "Speaker"}
+            self._detail(4, f"{len(speakers)} speakers" if speakers
+                         else "No separate speakers found")
         else:
             self._log("No HuggingFace token — skipping speaker diarization")
             segments = diarize(audio_path, segments, None,
                                progress_cb=self._progress, log_cb=self._log)
+            self._detail(4, "Add a Hugging Face token to name speakers", skipped=True)
 
         self._save_debug_transcript(segments, title)
 
@@ -222,6 +236,7 @@ class ProcessingWorker(QThread):
             f"({cropped_count} cropped to detected presentation screen)"
         )
         self._save_debug_frames(frames)
+        self._detail(5, f"{len(frames)} screenshots")
 
         # ── Stage 6: AI note generation ───────────────────────────────────
         self._stage(6, total)
@@ -245,6 +260,7 @@ class ProcessingWorker(QThread):
         boxes = notes.get("screenshot_boxes") or {}
         self._log(f"Generated {len(chapters)} chapters ({cited} screenshots "
                   f"referenced, {len(boxes)} with content crops)")
+        self._detail(6, f"{len(chapters)} chapters")
 
         # ── Stage 7: Write DOCX ───────────────────────────────────────────
         self._stage(7, total)
@@ -253,6 +269,8 @@ class ProcessingWorker(QThread):
                                         source_info)
         self._progress(100)
         self._log(f"Saved: {out_path}")
+        # The file name is in the completion line; the row says where it went
+        self._detail(7, f"Saved to {os.path.basename(os.path.dirname(out_path))}")
 
         self.completed.emit(out_path)
 
@@ -277,6 +295,9 @@ class ProcessingWorker(QThread):
         label = self.STAGES[n - 1]
         self.stage_changed.emit(label, n, total)
         self._log(f"[{n}/{total}] {label}")
+
+    def _detail(self, n: int, text: str, skipped: bool = False):
+        self.stage_detail.emit(n, text, skipped)
 
     def _progress(self, pct: int):
         self.stage_progress.emit(max(0, min(100, pct)))
@@ -320,6 +341,10 @@ class ProcessingWorker(QThread):
                 shutil.copy(frame["path"], os.path.join(dest, name))
         except OSError:
             pass
+
+
+def _lines(segments: list[dict]) -> str:
+    return f"{len(segments):,} lines"
 
 
 def load_saved_transcript() -> tuple[list[dict], dict]:

@@ -71,8 +71,10 @@ def cmd_gui(args) -> int:
             "text": win.process_btn.text(),
             "enabled": win.process_btn.isEnabled(),
         },
-        "stages": [lbl.text() for lbl in win.stage_labels],
-        "whisper_model": win.model_combo.currentText(),
+        "stages": [f"{state}: {lbl.text()}" + (f" ({d.text()})" if d.text() else "")
+                   for state, lbl, d in zip(win._stage_states, win.stage_labels,
+                                            win.stage_details)],
+        "whisper_model": win.model_combo.currentData(),
         "output_dir": win.output_dir_edit.text(),
         "reuse_enabled": win.reuse_transcript_check.isEnabled(),
         "reuse_info": win.reuse_info_label.text(),

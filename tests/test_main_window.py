@@ -105,21 +105,21 @@ class TestInputSource(MainWindowTestCase):
 class TestRunOutcome(MainWindowTestCase):
     def test_error_marks_current_stage_failed(self):
         self.win._on_stage_changed("Transcribing speech", 3, 7)
-        self.win._on_error("RuntimeError: boom")
+        self.win._on_error("KeyError: 'chapters'")
         self.win._set_idle()
-        stage = self.win.stage_labels[2].text()
-        self.assertTrue(stage.startswith("✕"), stage)
-        self.assertIn("boom", self.win.run_status.text())
+        states = self.win._stage_states
+        self.assertEqual(states[2], "failed")
+        self.assertIn("transcribing", self.win.run_status.text().lower())
         # Earlier stages really did finish; later ones never ran
-        self.assertTrue(self.win.stage_labels[1].text().startswith("✓"))
-        self.assertTrue(self.win.stage_labels[3].text().startswith("○"))
+        self.assertEqual(states[1], "done")
+        self.assertEqual(states[3], "pending")
 
     def test_cancel_does_not_leave_stage_active(self):
         self.win._worker = MagicMock(**{"isRunning.return_value": True})
         self.win._on_stage_changed("Extracting audio", 2, 7)
         self.win._cancel_processing()
         self.win._set_idle()
-        self.assertFalse(self.win.stage_labels[1].text().startswith("▶"))
+        self.assertEqual(self.win._stage_states[1], "cancelled")
         self.assertIn("Cancelled", self.win.run_status.text())
 
     def test_cancelling_label_fits_button(self):
@@ -134,7 +134,55 @@ class TestRunOutcome(MainWindowTestCase):
         self.win._set_idle()
         self.win._reset_progress()
         self.assertEqual(self.win.run_status.text(), "")
-        self.assertTrue(all(l.text().startswith("○") for l in self.win.stage_labels))
+        self.assertEqual(set(self.win._stage_states), {"pending"})
+        self.assertEqual({l.text() for l in self.win.stage_details}, {""})
+
+
+class TestStageRows(MainWindowTestCase):
+    def test_skipped_stage_is_not_shown_as_done(self):
+        self.win._on_stage_changed("Extracting audio", 2, 7)
+        self.win._on_stage_detail(2, "Not needed, transcript included", True)
+        self.win._on_stage_changed("Transcribing speech", 3, 7)
+        self.assertEqual(self.win._stage_states[1], "skipped")
+        self.assertIn("transcript included", self.win.stage_details[1].text())
+
+    def test_finished_stage_keeps_its_detail(self):
+        self.win._on_stage_changed("Extracting screenshots", 5, 7)
+        self.win._on_stage_detail(5, "34 screenshots", False)
+        self.win._on_stage_changed("Generating AI notes", 6, 7)
+        self.assertEqual(self.win._stage_states[4], "done")
+        self.assertTrue(self.win.stage_details[4].text().startswith("34 screenshots"))
+
+    def test_active_stage_shows_progress(self):
+        self.win._on_stage_changed("Transcribing speech", 3, 7)
+        self.win._on_stage_progress(43)
+        self.assertIn("43%", self.win.stage_details[2].text())
+
+    def test_completion_reports_total_time(self):
+        self.win._on_stage_changed("Writing document", 7, 7)
+        self.win._on_completed("/out/Weekly sync.docx")
+        self.assertIn("Weekly sync.docx", self.win.run_status.text())
+        self.assertEqual(set(self.win._stage_states), {"done"})
+
+
+class TestCopy(MainWindowTestCase):
+    def test_quality_labels_map_to_whisper_models(self):
+        combo = self.win.model_combo
+        self.assertEqual(combo.currentData(), "medium")
+        self.assertNotEqual(combo.currentText(), "medium")
+        models = [combo.itemData(i) for i in range(combo.count())]
+        self.assertEqual(models, ["tiny", "base", "small", "medium", "large-v3"])
+
+    def test_saved_model_is_restored(self):
+        self.win._settings.setValue("whisper_model", "small")
+        self.win._load_settings()
+        self.assertEqual(self.win.model_combo.currentData(), "small")
+
+    def test_no_templated_separators(self):
+        for lbl in self.win.findChildren(QLabel):
+            self.assertNotIn(" · ", lbl.text(), lbl.text())
+            self.assertNotIn(" — ", lbl.text(), lbl.text())
+        self.assertNotIn(" — ", self.win.url_edit.placeholderText())
 
 
 class TestLegibility(MainWindowTestCase):
