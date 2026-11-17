@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AutoNotes · Data Flow</title>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600;700&family=Noto+Serif:ital@0;1&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #ffffff;
+      --color-ink:     #2e404d;
+      --color-muted:   #4a5b68;
+      --color-accent:  #0072bc;
+      --font-sans:     'Noto Sans', system-ui, sans-serif;
+      --font-serif:    'Noto Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1200px; width: 100%; }
+    /* The SVG holds its readable width; the wrapper scrolls on narrow screens instead of the page. */
+    .diagram-container { width: 100%; overflow-x: auto; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+
+    svg { width: 100%; min-width: 840px; display: block; }
+    /* Paper can't scroll, so let the diagram shrink to the sheet rather than clip. */
+    @media print {
+      .diagram-container { overflow-x: visible; }
+      svg { min-width: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Data flow · AutoNotes</p>
+    <h1>What the data looks like at each step</h1>
+
+    <div class="diagram-container">
+      <!-- Parametric data-flow grid: 4 lanes × 6 steps → viewBox 840 × 436 -->
+      <svg viewBox="0 0 840 436" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="data-flow-title data-flow-desc">
+        <title id="data-flow-title">What the data looks like at each step</title>
+        <desc id="data-flow-desc">Data flow of an AutoNotes run across video hosts, the local worker, the Claude API and local disk: a web video becomes a media file, a WAV, a transcript and screenshots; the transcript and screenshots go to Claude, whose notes JSON is written into a DOCX on disk, while the transcript is also saved for reuse.</desc>
+        <defs>
+          <pattern id="df-dots" width="22" height="22" patternUnits="userSpaceOnUse">
+            <circle cx="11" cy="11" r="0.8" fill="rgba(46,64,77,0.10)"/>
+          </pattern>
+          <marker id="arr-muted" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#4a5b68"/></marker>
+          <marker id="arr-accent" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0072bc"/></marker>
+          <marker id="arr-link" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#005b96"/></marker>
+        </defs>
+
+        <!-- ============ Background structure ============ -->
+        <rect width="840" height="436" fill="#ffffff"/>
+        <rect width="840" height="436" fill="url(#df-dots)"/>
+        <rect x="0" y="36" width="840" height="80" fill="rgba(46,64,77,0.018)"/>
+        <rect x="0" y="196" width="840" height="80" fill="rgba(46,64,77,0.018)"/>
+        <g stroke="rgba(46,64,77,0.12)" stroke-width="0.8">
+          <line x1="0" y1="36" x2="840" y2="36"/>
+          <line x1="0" y1="116" x2="840" y2="116"/>
+          <line x1="0" y1="196" x2="840" y2="196"/>
+          <line x1="0" y1="276" x2="840" y2="276"/>
+          <line x1="0" y1="356" x2="840" y2="356"/>
+          <line x1="140" y1="36" x2="140" y2="356"/>
+        </g>
+
+        <!-- ============ Step header: numbers match the app's 7 pipeline stages ============ -->
+        <g font-family="'Geist Mono', monospace" text-anchor="middle">
+          <rect x="180" y="6" width="32" height="16" rx="8" fill="rgba(46,64,77,0.12)"/>
+          <text x="196" y="17" fill="#2e404d" font-size="7" font-weight="600">01</text>
+          <text x="196" y="31" fill="#4a5b68" font-size="6.5" letter-spacing="0.12em">FETCH</text>
+
+          <rect x="292" y="6" width="32" height="16" rx="8" fill="rgba(46,64,77,0.12)"/>
+          <text x="308" y="17" fill="#2e404d" font-size="7" font-weight="600">02</text>
+          <text x="308" y="31" fill="#4a5b68" font-size="6.5" letter-spacing="0.12em">AUDIO</text>
+
+          <rect x="404" y="6" width="32" height="16" rx="8" fill="rgba(46,64,77,0.12)"/>
+          <text x="420" y="17" fill="#2e404d" font-size="7" font-weight="600">03–04</text>
+          <text x="420" y="31" fill="#4a5b68" font-size="6.5" letter-spacing="0.12em">TRANSCRIBE</text>
+
+          <rect x="516" y="6" width="32" height="16" rx="8" fill="rgba(46,64,77,0.12)"/>
+          <text x="532" y="17" fill="#2e404d" font-size="7" font-weight="600">05</text>
+          <text x="532" y="31" fill="#4a5b68" font-size="6.5" letter-spacing="0.12em">FRAMES</text>
+
+          <rect x="628" y="6" width="32" height="16" rx="8" fill="rgba(0,114,188,0.20)"/>
+          <text x="644" y="17" fill="#0072bc" font-size="7" font-weight="600">06</text>
+          <text x="644" y="31" fill="#0072bc" font-size="6.5" letter-spacing="0.12em">NOTES</text>
+
+          <rect x="740" y="6" width="32" height="16" rx="8" fill="rgba(46,64,77,0.12)"/>
+          <text x="756" y="17" fill="#2e404d" font-size="7" font-weight="600">07</text>
+          <text x="756" y="31" fill="#4a5b68" font-size="6.5" letter-spacing="0.12em">DOCX</text>
+        </g>
+
+        <!-- ============ Lane labels ============ -->
+        <g font-family="'Geist Mono', monospace" font-size="7" font-weight="500" text-anchor="middle" letter-spacing="0.18em" fill="#4a5b68">
+          <text x="70" y="72">VIDEO</text><text x="70" y="84">HOSTS</text>
+          <text x="70" y="152">LOCAL</text><text x="70" y="164">WORKER</text>
+          <text x="70" y="232">CLAUDE</text><text x="70" y="244">API</text>
+          <text x="70" y="312">LOCAL</text><text x="70" y="324">DISK</text>
+        </g>
+
+        <!-- ============ Arrows (before nodes) ============ -->
+        <!-- Host → Download (same step, down) -->
+        <line x1="196" y1="108" x2="196" y2="124" stroke="#4a5b68" stroke-width="1" marker-end="url(#arr-muted)"/>
+        <!-- Worker lane hand-offs -->
+        <line x1="246" y1="156" x2="258" y2="156" stroke="#4a5b68" stroke-width="1" marker-end="url(#arr-muted)"/>
+        <line x1="358" y1="156" x2="370" y2="156" stroke="#4a5b68" stroke-width="1" marker-end="url(#arr-muted)"/>
+        <line x1="470" y1="156" x2="482" y2="156" stroke="#4a5b68" stroke-width="1" marker-end="url(#arr-muted)"/>
+        <!-- Transcript saved for reuse (passes the empty Claude cell) -->
+        <line x1="420" y1="188" x2="420" y2="284" stroke="#4a5b68" stroke-width="1" marker-end="url(#arr-muted)"/>
+        <!-- Focal: transcript + screenshots leave the machine for Claude -->
+        <path d="M 582,156 H 636 Q 644,156 644,164 V 204" fill="none" stroke="#0072bc" stroke-width="1.2" marker-end="url(#arr-accent)"/>
+        <!-- Notes JSON back to the worker (bottom edge, left port) -->
+        <path d="M 694,236 H 732 Q 740,236 740,228 V 188" fill="none" stroke="#4a5b68" stroke-width="1" marker-end="url(#arr-muted)"/>
+        <!-- DOCX written to disk (bottom edge, right port) -->
+        <line x1="772" y1="188" x2="772" y2="284" stroke="#005b96" stroke-width="1" marker-end="url(#arr-link)"/>
+
+        <!-- Focal label only -->
+        <rect x="586" y="172" width="50" height="11" rx="2" fill="#ffffff"/>
+        <text x="611" y="180" fill="#0072bc" font-size="6.5" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">TEXT+JPEGS</text>
+
+        <!-- ============ Nodes ============ -->
+        <g font-family="'Noto Sans', sans-serif" text-anchor="middle">
+
+          <!-- HST · 01 Video host -->
+          <rect x="146" y="44" width="100" height="64" rx="6" fill="#ffffff" stroke="rgba(46,64,77,0.25)" stroke-width="1"/>
+          <rect x="150" y="48" width="18" height="10" rx="3" fill="rgba(46,64,77,0.12)"/>
+          <text x="159" y="55" fill="#2e404d" font-size="6" font-weight="600" font-family="'Geist Mono', monospace">HST</text>
+          <text x="196" y="67" fill="#2e404d" font-size="9" font-weight="600">Video host</text>
+          <text x="196" y="79" fill="#4a5b68" font-size="6.5" font-family="'Geist Mono', monospace">YouTube · SharePoint</text>
+          <text x="196" y="91" fill="#5e6e7a" font-size="6.5" font-family="'Geist Mono', monospace">HTTPS · cookies</text>
+          <rect x="226" y="98" width="16" height="8" rx="3" fill="#6e6479"/><text x="234" y="104" fill="#ffffff" font-size="5" font-weight="700" font-family="'Geist Mono', monospace">WB</text>
+
+          <!-- WRK · 01 Download -->
+          <rect x="146" y="124" width="100" height="64" rx="6" fill="#ffffff" stroke="rgba(46,64,77,0.25)" stroke-width="1"/>
+          <rect x="150" y="128" width="18" height="10" rx="3" fill="rgba(46,64,77,0.12)"/>
+          <text x="159" y="135" fill="#2e404d" font-size="6" font-weight="600" font-family="'Geist Mono', monospace">WRK</text>
+          <text x="196" y="147" fill="#2e404d" font-size="9" font-weight="600">Download</text>
+          <text x="196" y="159" fill="#4a5b68" font-size="6.5" font-family="'Geist Mono', monospace">video + captions</text>
+          <text x="196" y="171" fill="#5e6e7a" font-size="6.5" font-family="'Geist Mono', monospace">yt-dlp · ffmpeg</text>
+          <rect x="150" y="178" width="16" height="8" rx="3" fill="#6e6479"/><text x="158" y="184" fill="#ffffff" font-size="5" font-weight="700" font-family="'Geist Mono', monospace">WB</text>
+          <rect x="226" y="178" width="16" height="8" rx="3" fill="#5e7a9b"/><text x="234" y="184" fill="#ffffff" font-size="5" font-weight="700" font-family="'Geist Mono', monospace">DB</text>
+
+          <!-- WRK · 02 Extract audio -->
+          <rect x="258" y="124" width="100" height="64" rx="6" fill="#ffffff" stroke="rgba(46,64,77,0.25)" stroke-width="1"/>
+          <rect x="262" y="128" width="18" height="10" rx="3" fill="rgba(46,64,77,0.12)"/>
+          <text x="271" y="135" fill="#2e404d" font-size="6" font-weight="600" font-family="'Geist Mono', monospace">WRK</text>
+          <text x="308" y="147" fill="#2e404d" font-size="9" font-weight="600">Extract audio</text>
+          <text x="308" y="159" fill="#4a5b68" font-size="6.5" font-family="'Geist Mono', monospace">16 kHz mono WAV</text>
+          <text x="308" y="171" fill="#5e6e7a" font-size="6.5" font-family="'Geist Mono', monospace">ffmpeg</text>
+          <rect x="262" y="178" width="16" height="8" rx="3" fill="#5e7a9b"/><text x="270" y="184" fill="#ffffff" font-size="5" font-weight="700" font-family="'Geist Mono', monospace">DB</text>
+          <rect x="338" y="178" width="16" height="8" rx="3" fill="#5e7a9b"/><text x="346" y="184" fill="#ffffff" font-size="5" font-weight="700" font-family="'Geist Mono', monospace">DB</text>
+
+          <!-- WRK · 03–04 Transcribe -->
+          <rect x="370" y="124" width="100" height="64" rx="6" fill="#ffffff" stroke="rgba(46,64,77,0.25)" stroke-width="1"/>
+          <rect x="374" y="128" width="18" height="10" rx="3" fill="rgba(46,64,77,0.12)"/>
+          <text x="383" y="135" fill="#2e404d" font-size="6" font-weight="600" font-family="'Geist Mono', monospace">WRK</text>
+          <text x="420" y="147" fill="#2e404d" font-size="9" font-weight="600">Transcribe</text>
+          <text x="420" y="159" fill="#4a5b68" font-size="6.5" font-family="'Geist Mono', monospace">segments + speakers</text>
+          <text x="420" y="171" fill="#5e6e7a" font-size="6.5" font-family="'Geist Mono', monospace">whisper · pyannote</text>
+          <rect x="374" y="178" width="16" height="8" rx="3" fill="#5e7a9b"/><text x="382" y="184" fill="#ffffff" font-size="5" font-weight="700" font-family="'Geist Mono', monospace">DB</text>
+          <rect x="450" y="178" width="16" height="8" rx="3" fill="#b8915a"/><text x="458" y="184" fill="#ffffff" font-size="5" font-weight="700" font-family="'Geist Mono', monospace">TB</text>
+
+          <!-- WRK · 05 Pick frames -->
+          <rect x="482" y="124" width="100" height="64" rx="6" fill="#ffffff" stroke="rgba(46,64,77,0.25)" stroke-width="1"/>
+          <rect x="486" y="128" width="18" height="10" rx="3" fill="rgba(46,64,77,0.12)"/>
+          <text x="495" y="135" fill="#2e404d" font-size="6" font-weight="600" font-family="'Geist Mono', monospace">WRK</text>
+          <text x="532" y="147" fill="#2e404d" font-size="9" font-weight="600">Pick frames</text>
+          <text x="532" y="159" fill="#4a5b68" font-size="6.5" font-family="'Geist Mono', monospace">≤60 JPEG screenshots</text>
+          <text x="532" y="171" fill="#5e6e7a" font-size="6.5" font-family="'Geist Mono', monospace">ffmpeg · OpenCV</text>
+          <rect x="486" y="178" width="16" height="8" rx="3" fill="#b8915a"/><text x="494" y="184" fill="#ffffff" font-size="5" font-weight="700" font-family="'Geist Mono', monospace">TB</text>
+          <rect x="562" y="178" width="16" height="8" rx="3" fill="#5e7a9b"/><text x="570" y="184" fill="#ffffff" font-size="5" font-weight="700" font-family="'Geist Mono', monospace">DB</text>
+
+          <!-- WRK · 07 Write DOCX -->
+          <rect x="706" y="124" width="100" height="64" rx="6" fill="#ffffff" stroke="rgba(46,64,77,0.25)" stroke-width="1"/>
+          <rect x="710" y="128" width="18" height="10" rx="3" fill="rgba(46,64,77,0.12)"/>
+          <text x="719" y="135" fill="#2e404d" font-size="6" font-weight="600" font-family="'Geist Mono', monospace">WRK</text>
+          <text x="756" y="147" fill="#2e404d" font-size="9" font-weight="600">Write DOCX</text>
+          <text x="756" y="159" fill="#4a5b68" font-size="6.5" font-family="'Geist Mono', monospace">crop + embed frames</text>
+          <text x="756" y="171" fill="#5e6e7a" font-size="6.5" font-family="'Geist Mono', monospace">python-docx</text>
+          <rect x="710" y="178" width="16" height="8" rx="3" fill="#b8915a"/><text x="718" y="184" fill="#ffffff" font-size="5" font-weight="700" font-family="'Geist Mono', monospace">TB</text>
+          <rect x="786" y="178" width="16" height="8" rx="3" fill="#9c6b50"/><text x="794" y="184" fill="#ffffff" font-size="5" font-weight="700" font-family="'Geist Mono', monospace">FL</text>
+
+          <!-- API · 06 Generate notes (focal) -->
+          <rect x="594" y="204" width="100" height="64" rx="6" fill="rgba(0,114,188,0.07)" stroke="#0072bc" stroke-width="1"/>
+          <rect x="598" y="208" width="18" height="10" rx="3" fill="rgba(0,114,188,0.20)"/>
+          <text x="607" y="215" fill="#0072bc" font-size="6" font-weight="600" font-family="'Geist Mono', monospace">API</text>
+          <text x="644" y="227" fill="#2e404d" font-size="9" font-weight="600">Generate notes</text>
+          <text x="644" y="239" fill="#4a5b68" font-size="6.5" font-family="'Geist Mono', monospace">notes JSON + crops</text>
+          <text x="644" y="251" fill="#5e6e7a" font-size="6.5" font-family="'Geist Mono', monospace">claude-sonnet-5</text>
+          <rect x="598" y="258" width="16" height="8" rx="3" fill="#5e7a9b"/><text x="606" y="264" fill="#ffffff" font-size="5" font-weight="700" font-family="'Geist Mono', monospace">DB</text>
+          <rect x="674" y="258" width="16" height="8" rx="3" fill="#b8915a"/><text x="682" y="264" fill="#ffffff" font-size="5" font-weight="700" font-family="'Geist Mono', monospace">TB</text>
+
+          <!-- DSK · 03–04 Saved transcript -->
+          <rect x="370" y="284" width="100" height="64" rx="6" fill="#ffffff" stroke="rgba(46,64,77,0.25)" stroke-width="1"/>
+          <rect x="374" y="288" width="18" height="10" rx="3" fill="rgba(46,64,77,0.12)"/>
+          <text x="383" y="295" fill="#2e404d" font-size="6" font-weight="600" font-family="'Geist Mono', monospace">DSK</text>
+          <text x="420" y="307" fill="#2e404d" font-size="9" font-weight="600">Saved transcript</text>
+          <text x="420" y="319" fill="#4a5b68" font-size="6.5" font-family="'Geist Mono', monospace">last_transcript.json</text>
+          <text x="420" y="331" fill="#5e6e7a" font-size="6.5" font-family="'Geist Mono', monospace">~/Library/Logs</text>
+          <rect x="374" y="338" width="16" height="8" rx="3" fill="#b8915a"/><text x="382" y="344" fill="#ffffff" font-size="5" font-weight="700" font-family="'Geist Mono', monospace">TB</text>
+
+          <!-- DSK · 07 Notes document -->
+          <rect x="706" y="284" width="100" height="64" rx="6" fill="#ffffff" stroke="rgba(46,64,77,0.25)" stroke-width="1"/>
+          <rect x="710" y="288" width="18" height="10" rx="3" fill="rgba(46,64,77,0.12)"/>
+          <text x="719" y="295" fill="#2e404d" font-size="6" font-weight="600" font-family="'Geist Mono', monospace">DSK</text>
+          <text x="756" y="307" fill="#2e404d" font-size="9" font-weight="600">Notes document</text>
+          <text x="756" y="319" fill="#4a5b68" font-size="6.5" font-family="'Geist Mono', monospace">.docx in output dir</text>
+          <text x="756" y="331" fill="#5e6e7a" font-size="6.5" font-family="'Geist Mono', monospace">default ~/Desktop</text>
+          <rect x="710" y="338" width="16" height="8" rx="3" fill="#9c6b50"/><text x="718" y="344" fill="#ffffff" font-size="5" font-weight="700" font-family="'Geist Mono', monospace">FL</text>
+        </g>
+
+        <!-- ============ Legend strip ============ -->
+        <g font-family="'Geist Mono', monospace" font-size="6.5" fill="#4a5b68">
+          <!-- STEPS -->
+          <text x="144" y="375" letter-spacing="0.14em">STEPS</text>
+          <g text-anchor="middle" font-size="6" font-weight="600">
+            <rect x="200" y="367" width="24" height="10" rx="5" fill="rgba(46,64,77,0.12)"/><text x="212" y="374" fill="#2e404d">01</text>
+            <rect x="300" y="367" width="24" height="10" rx="5" fill="rgba(46,64,77,0.12)"/><text x="312" y="374" fill="#2e404d">02</text>
+            <rect x="400" y="367" width="24" height="10" rx="5" fill="rgba(46,64,77,0.12)"/><text x="412" y="374" fill="#2e404d">03–04</text>
+            <rect x="500" y="367" width="24" height="10" rx="5" fill="rgba(46,64,77,0.12)"/><text x="512" y="374" fill="#2e404d">05</text>
+            <rect x="600" y="367" width="24" height="10" rx="5" fill="rgba(0,114,188,0.20)"/><text x="612" y="374" fill="#0072bc">06</text>
+            <rect x="700" y="367" width="24" height="10" rx="5" fill="rgba(46,64,77,0.12)"/><text x="712" y="374" fill="#2e404d">07</text>
+          </g>
+          <text x="228" y="375">Fetch</text>
+          <text x="328" y="375">Audio</text>
+          <text x="428" y="375">Transcribe</text>
+          <text x="528" y="375">Frames</text>
+          <text x="628" y="375" fill="#0072bc">Notes</text>
+          <text x="728" y="375">DOCX</text>
+
+          <!-- DATA TYPE -->
+          <text x="144" y="396" letter-spacing="0.14em">DATA TYPE</text>
+          <g font-size="5" font-weight="700" fill="#ffffff" text-anchor="middle">
+            <rect x="200" y="389" width="16" height="8" rx="3" fill="#6e6479"/><text x="208" y="395">WB</text>
+            <rect x="276" y="389" width="16" height="8" rx="3" fill="#5e7a9b"/><text x="284" y="395">DB</text>
+            <rect x="356" y="389" width="16" height="8" rx="3" fill="#b8915a"/><text x="364" y="395">TB</text>
+            <rect x="452" y="389" width="16" height="8" rx="3" fill="#9c6b50"/><text x="460" y="395">FL</text>
+          </g>
+          <text x="220" y="396">web video</text>
+          <text x="296" y="396">media file</text>
+          <text x="376" y="396">structured JSON</text>
+          <text x="472" y="396">document</text>
+          <text x="540" y="396" fill="#5e6e7a">left chip = input · right chip = output</text>
+
+          <!-- FLOW -->
+          <text x="144" y="418" letter-spacing="0.14em">FLOW</text>
+          <line x1="200" y1="415" x2="220" y2="415" stroke="#4a5b68" stroke-width="1" marker-end="url(#arr-muted)"/>
+          <text x="228" y="418">hand-off</text>
+          <line x1="296" y1="415" x2="316" y2="415" stroke="#0072bc" stroke-width="1.2" marker-end="url(#arr-accent)"/>
+          <text x="324" y="418">leaves the machine</text>
+          <line x1="436" y1="415" x2="456" y2="415" stroke="#005b96" stroke-width="1" marker-end="url(#arr-link)"/>
+          <text x="464" y="418">final output</text>
+        </g>
+      </svg>
+    </div>
+  </div>
+</body>
+</html>
