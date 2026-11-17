@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14   # Apple Silicon (arm64) — matches the target platform
+    runs-on: macos-15   # Apple Silicon (arm64) — matches the target platform
 
     steps:
       # Actions are pinned to full commit SHAs (tag in the comment): a moved
