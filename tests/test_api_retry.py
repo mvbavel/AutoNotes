@@ -7,13 +7,17 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import anthropic
-import httpx
+
+try:   # anthropic 1.x+ sits on httpx2 and no longer installs httpx
+    import httpx2 as http
+except ImportError:
+    import httpx as http
 
 from pipeline import note_generator
 
 
-def _response(status: int) -> httpx.Response:
-    return httpx.Response(status, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+def _response(status: int):
+    return http.Response(status, request=http.Request("POST", "https://api.anthropic.com/v1/messages"))
 
 
 def _error_body(error_type: str) -> dict:
@@ -64,6 +68,11 @@ class TestCallWithRetry(unittest.TestCase):
         note_generator._RETRY_BASE_WAIT = self._orig_wait
 
     def test_mid_stream_read_error_is_retried(self):
+        # anthropic 0.x raised httpx errors; they must still be retried
+        try:
+            import httpx
+        except ImportError:
+            self.skipTest("httpx not installed; covered by the httpx2 test below")
         client = _FakeClient([
             _FakeStream(fail_with=httpx.ReadError("connection reset by peer")),
             _FakeStream(message="recovered"),
@@ -91,11 +100,11 @@ class TestCallWithRetry(unittest.TestCase):
 
     def test_persistent_failure_raises_after_max_retries(self):
         client = _FakeClient([
-            _FakeStream(fail_with=httpx.ReadError("reset"))
+            _FakeStream(fail_with=http.ReadError("reset"))
             for _ in range(note_generator.MAX_RETRIES)
         ])
         logs = []
-        with self.assertRaises(httpx.ReadError):
+        with self.assertRaises(http.ReadError):
             note_generator._call_with_retry(client, [], log_cb=logs.append)
         self.assertEqual(client.attempts, note_generator.MAX_RETRIES)
         self.assertTrue(any("failed after" in m for m in logs))

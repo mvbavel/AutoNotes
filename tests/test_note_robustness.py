@@ -15,7 +15,11 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import anthropic
-import httpx
+
+try:   # anthropic 1.x+ sits on httpx2 and no longer installs httpx
+    import httpx2 as http
+except ImportError:
+    import httpx as http
 
 from pipeline import note_generator as ng
 
@@ -107,18 +111,18 @@ class TestFallbackNotes(_DebugDirCase):
 class TestTransportErrors(unittest.TestCase):
     def test_both_http_libraries_are_retried(self):
         errors = ng._transport_errors()
-        self.assertIn(httpx.TransportError, errors)
+        self.assertIn(http.TransportError, errors)
+        self.assertTrue(ng._is_retryable(http.ReadError("reset")))
         try:
-            import httpx2
+            import httpx
         except ImportError:
             return
-        self.assertIn(httpx2.TransportError, errors)
-        self.assertTrue(ng._is_retryable(httpx2.ReadError("reset")))
+        self.assertIn(httpx.TransportError, errors)
 
 
 def _status_error(cls, status):
-    request = httpx.Request("GET", "https://api.anthropic.com/v1/models/x")
-    return cls("e", response=httpx.Response(status, request=request), body=None)
+    request = http.Request("GET", "https://api.anthropic.com/v1/models/x")
+    return cls("e", response=http.Response(status, request=request), body=None)
 
 
 class TestCheckApiKey(unittest.TestCase):
@@ -143,7 +147,7 @@ class TestCheckApiKey(unittest.TestCase):
         self.assertIn(ng.MODEL, str(ctx.exception))
 
     def test_offline_does_not_block_the_run(self):
-        request = httpx.Request("GET", "https://api.anthropic.com")
+        request = http.Request("GET", "https://api.anthropic.com")
         with self._client(anthropic.APIConnectionError(request=request)):
             note = ng.check_api_key("sk-ant-x")
         self.assertIn("continuing", note)

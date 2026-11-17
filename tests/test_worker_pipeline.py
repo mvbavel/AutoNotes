@@ -12,7 +12,11 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import anthropic
-import httpx
+
+try:   # anthropic 1.x+ sits on httpx2 and no longer installs httpx
+    import httpx2 as http
+except ImportError:
+    import httpx as http
 
 import pipeline.worker as worker
 
@@ -99,9 +103,9 @@ class TestTranscriptReuse(WorkerCase):
 
 class TestPreflight(WorkerCase):
     def test_rejected_key_fails_before_downloading(self):
-        request = httpx.Request("GET", "https://api.anthropic.com")
+        request = http.Request("GET", "https://api.anthropic.com")
         self.mocks["check_api_key"].side_effect = anthropic.AuthenticationError(
-            "bad key", response=httpx.Response(401, request=request), body=None)
+            "bad key", response=http.Response(401, request=request), body=None)
         with self.assertRaises(anthropic.AuthenticationError):
             self.run_worker(source="https://www.youtube.com/watch?v=x")
         self.mocks["download_youtube"].assert_not_called()
