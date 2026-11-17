@@ -2,22 +2,30 @@
 import glob
 import json
 import os
-import re
-import subprocess
+from urllib.parse import urlparse
 
 from pipeline._paths import FFMPEG, YTDLP_FRAGMENT_ARGS, ytdlp_command
-from pipeline._util import safe_filename
+from pipeline._util import (
+    PipelineCancelled, find_video, run_capture, run_streaming, safe_filename,
+    ytdlp_template,
+)
+from pipeline.download_progress import DownloadProgress
 from pipeline.sharepoint_transcript import fetch_transcript
 from pipeline.vtt_parser import parse_srt, parse_vtt
 
 YTDLP_CMD = ytdlp_command()
 
-_TEAMS_PATTERNS = [
-    r"teams\.microsoft\.com",
-    r"sharepoint\.com",
-    r"stream\.microsoft\.com",
-    r"microsoftstream\.com",
-]
+# Kept under its old name for tests written against it
+_DownloadProgress = DownloadProgress
+
+_TEAMS_DOMAINS = (
+    "teams.microsoft.com",
+    "sharepoint.com",
+    "stream.microsoft.com",
+    "microsoftstream.com",
+)
+
+_METADATA_TIMEOUT = 60
 
 # Edge first: SharePoint's FedAuth/rtFa are persistent cookies there ("keep me
 # signed in"), but session-only in Chrome. --cookies-from-browser reads the
@@ -27,100 +35,17 @@ _BROWSERS = ["edge", "chrome"]
 
 
 def is_teams_url(url: str) -> bool:
-    return any(re.search(p, url, re.I) for p in _TEAMS_PATTERNS)
+    """True when the URL's *host* is a Microsoft recording host.
 
-
-class _DownloadProgress:
-    """Turn yt-dlp's --newline output into throttled, readable log lines.
-
-    Teams recordings arrive as hundreds of DASH fragments over several minutes,
-    so the raw stream is far too chatty to log verbatim and yt-dlp's own "N%" is
-    untrustworthy: for fragmented downloads it is a share of an estimated total
-    that keeps growing, so it reads 0.2% -> 0.1% -> 0.0% while the estimate
-    climbs from 347KiB to 330MiB. "(frag N/462)" is monotonic with a known
-    denominator, so prefer it and fall back to "%" only for progressive
-    (single-file) downloads.
+    Matched on the hostname, not the whole string: a Teams URL is downloaded
+    with the browser's cookies, so "youtube.com/watch?v=x&ref=sharepoint.com"
+    or "evil.example/sharepoint.com/x" must not qualify.
     """
-
-    _LOG_EVERY_PCT = 5       # one log line per 5% of a stream
-    _STAGE_CEILING = 80      # download is 0-80% of the enclosing stage
-
-    _FRAG = re.compile(r"\(frag (\d+)/(\d+)\)")
-    _PCT = re.compile(r"(\d+(?:\.\d+)?)%")
-    _SPEED = re.compile(r"\bat\s+([\d.]+\s*[KMG]?i?B/s)")
-    _ETA = re.compile(r"\bETA\s+(\S+)")
-    _DEST = re.compile(r"^\[download\] Destination:\s*(.+)$")
-
-    def __init__(self, log_cb=None, progress_cb=None):
-        self._log_cb = log_cb
-        self._progress_cb = progress_cb
-        self._label = ""
-        self._last_bucket = -1
-        # yt-dlp restarts the fragment counter for each stream (video, then
-        # audio), so clamp to a high-water mark or the bar would rewind.
-        self._high_water = 0
-
-    def feed(self, line: str) -> None:
-        line = line.rstrip()
-        if not line or line.startswith("[debug]"):
-            return
-
-        dest = self._DEST.match(line)
-        if dest:
-            self._start_stream(dest.group(1))
-            self._log(line)
-            return
-
-        pct = self._PCT.search(line)
-        if not pct:
-            self._log(line)
-            return
-
-        frag = self._FRAG.search(line)
-        if frag:
-            cur, total = int(frag.group(1)), int(frag.group(2))
-            frac = cur / total if total else 0.0
-        else:
-            frac = float(pct.group(1)) / 100.0
-
-        frac = max(0.0, min(frac, 1.0))
-        self._report(frac)
-
-        bucket = int(frac * 100) // self._LOG_EVERY_PCT
-        if bucket > self._last_bucket:
-            self._last_bucket = bucket
-            self._log(self._describe(frac, frag, line))
-
-    # ── internals ─────────────────────────────────────────────────────────────
-
-    def _start_stream(self, dest: str) -> None:
-        name = os.path.basename(dest).lower()
-        # yt-dlp names DASH streams ...audcopy / ...vcopy
-        self._label = "audio" if ("aud" in name or "audio" in name) else "video"
-        self._last_bucket = -1
-
-    def _report(self, frac: float) -> None:
-        pct = min(int(frac * self._STAGE_CEILING), self._STAGE_CEILING)
-        self._high_water = max(self._high_water, pct)
-        if self._progress_cb:
-            self._progress_cb(self._high_water)
-
-    def _describe(self, frac: float, frag, line: str) -> str:
-        what = f"Downloading {self._label}" if self._label else "Downloading"
-        parts = [f"{what}: {int(frac * 100)}%"]
-        if frag:
-            parts.append(f"(frag {frag.group(1)}/{frag.group(2)})")
-        speed = self._SPEED.search(line)
-        if speed:
-            parts.append(f"at {speed.group(1).replace(' ', '')}")
-        eta = self._ETA.search(line)
-        if eta and eta.group(1) != "Unknown":
-            parts.append(f"ETA {eta.group(1)}")
-        return " ".join(parts)
-
-    def _log(self, msg: str) -> None:
-        if self._log_cb:
-            self._log_cb(msg)
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return any(host == d or host.endswith("." + d) for d in _TEAMS_DOMAINS)
 
 
 def download_teams_recording(
@@ -149,14 +74,14 @@ def download_teams_recording(
         "transcript_segments": None,
     }
 
-    info = _fetch_info(url, log_cb)
+    info = _fetch_info(url, log_cb, cancel_check)
     if info:
         result["title"] = info.get("title") or "Teams Recording"
         result["description"] = info.get("description") or ""
         result["duration"] = float(info.get("duration") or 0)
 
     safe_title = safe_filename(result["title"])
-    out_template = os.path.join(output_dir, f"{safe_title}.%(ext)s")
+    out_template = ytdlp_template(output_dir, safe_title)
 
     ffmpeg_dir = os.path.dirname(FFMPEG)
 
@@ -185,11 +110,9 @@ def download_teams_recording(
         )
 
     # yt-dlp may produce a .mkv or other container — find what landed
-    for ext in ("mp4", "mkv", "webm", "mov"):
-        candidate = os.path.join(output_dir, f"{safe_title}.{ext}")
-        if os.path.exists(candidate):
-            result["video_path"] = candidate
-            break
+    result["video_path"] = find_video(output_dir, safe_title)
+    if result["video_path"] is None:
+        raise RuntimeError("The download finished but no video file was produced.")
 
     if progress_cb:
         progress_cb(80)
@@ -231,7 +154,7 @@ def download_teams_recording(
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
-def _fetch_info(url: str, log_cb=None) -> dict | None:
+def _fetch_info(url: str, log_cb=None, cancel_check=None) -> dict | None:
     for browser in _BROWSERS:
         cmd = [
             *YTDLP_CMD,
@@ -241,13 +164,15 @@ def _fetch_info(url: str, log_cb=None) -> dict | None:
             url,
         ]
         try:
-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            out = run_capture(cmd, timeout=_METADATA_TIMEOUT, cancel_check=cancel_check)
             if out.returncode == 0:
                 return json.loads(out.stdout)
             if log_cb:
                 err = (out.stderr or "").strip().splitlines()
                 log_cb(f"Metadata fetch with {browser} cookies failed"
                        + (f": {err[-1]}" if err else ""))
+        except PipelineCancelled:
+            raise
         except Exception as e:
             if log_cb:
                 log_cb(f"Metadata fetch with {browser} cookies failed: {e}")
@@ -275,19 +200,5 @@ def _run_download(url: str, out_template: str, ffmpeg_dir: str, browser: str,
         "-o", out_template,
         url,
     ]
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-    )
-    reporter = _DownloadProgress(log_cb=log_cb, progress_cb=progress_cb)
-    try:
-        for line in proc.stdout:
-            if cancel_check:
-                cancel_check()
-            reporter.feed(line)
-        proc.wait()
-    except Exception:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait()
-        raise
-    return proc.returncode == 0
+    reporter = DownloadProgress(log_cb=log_cb, progress_cb=progress_cb)
+    return run_streaming(cmd, on_line=reporter.feed, cancel_check=cancel_check) == 0

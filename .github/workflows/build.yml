@@ -4,22 +4,29 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+  pull_request:
   workflow_dispatch:
 
+# Read-only by default. Only the release job, which runs for version tags
+# alone, is given write access — a push to main can't publish anything.
 permissions:
-  contents: write   # required to create GitHub Releases and upload assets
+  contents: read
 
 jobs:
   build:
-    runs-on: macos-14   # Apple Silicon (arm64) — matches the target platform
+    runs-on: macos-15   # Apple Silicon (arm64) — matches the target platform
 
     steps:
-      - uses: actions/checkout@v7
+      # Actions are pinned to full commit SHAs (tag in the comment): a moved
+      # tag can't change what runs in a job that builds a shipped binary.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       # Must match the local build environment: the codebase uses PEP 604
       # union syntax and several dependencies require Python >= 3.10
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.14'
 
@@ -28,28 +35,40 @@ jobs:
       - name: Install Homebrew dependencies
         run: brew install ffmpeg
 
-      # Cache the pip download cache and installed packages to speed up re-runs
+      # Cache the pip download cache to speed up re-runs
       - name: Cache pip
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ~/Library/Caches/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.lock') }}
           restore-keys: pip-${{ runner.os }}-
 
+      # The lockfile, not requirements.txt: a release must not change because
+      # something upstream published that morning. (monthly-rebuild.yml does
+      # the opposite on purpose, to catch extractor rot.)
       - name: Install Python dependencies
         run: |
-          pip3 install -r requirements.txt
-          pip3 install pyinstaller
+          pip3 install -r requirements.lock
+          pip3 install coverage==7.17.3 ruff==0.17.5
 
+      - name: Lint
+        run: ruff check
+
+      # Coverage is measured on the code the tests can reach without a
+      # display, network or Claude; the floor stops it quietly sliding back.
       - name: Run tests
-        run: python3 -m unittest discover tests -v
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python3 -m coverage run -m unittest discover tests -v
+          python3 -m coverage report
 
       # PyInstaller caches bytecode in __pycache__; the Analysis cache lives in build/
       - name: Cache PyInstaller build
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: build
-          key: pyinstaller-${{ runner.os }}-${{ hashFiles('AutoNotes.spec', 'requirements.txt') }}
+          key: pyinstaller-${{ runner.os }}-${{ hashFiles('AutoNotes.spec', 'requirements.lock') }}
           restore-keys: pyinstaller-${{ runner.os }}-
 
       - name: Build AutoNotes.app
@@ -61,26 +80,51 @@ jobs:
       - name: Create DMG
         run: bash make_dmg.sh
 
+      # Published next to the DMG so a download can be checked:
+      #   shasum -a 256 -c AutoNotes.dmg.sha256
+      - name: Checksum
+        working-directory: dist
+        run: shasum -a 256 AutoNotes.dmg | tee AutoNotes.dmg.sha256
+
       - name: Upload DMG artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: AutoNotes-dmg
-          path: dist/AutoNotes.dmg
+          path: |
+            dist/AutoNotes.dmg
+            dist/AutoNotes.dmg.sha256
           retention-days: 14
 
-      # Only publish a GitHub Release when a version tag is pushed (e.g. v1.2.0)
-      #
-      # Done with gh rather than an action because the upload needs retries: the
-      # ~400 MB DMG occasionally dies mid-stream ("other side closed") when the
-      # release-asset endpoint is degraded, and a one-shot upload turns a
-      # transient blip into a stuck release. Publishing is deferred until the
-      # asset is attached, so a failure never leaves a visible release that
-      # nothing can be downloaded from. Every step is idempotent, so re-running
-      # the job after a failure resumes rather than duplicating.
+  # Only publish a GitHub Release when a version tag is pushed (e.g. v1.2.0)
+  #
+  # Done with gh rather than an action because the upload needs retries: the
+  # ~400 MB DMG occasionally dies mid-stream ("other side closed") when the
+  # release-asset endpoint is degraded, and a one-shot upload turns a
+  # transient blip into a stuck release. Publishing is deferred until the
+  # asset is attached, so a failure never leaves a visible release that
+  # nothing can be downloaded from. Every step is idempotent, so re-running
+  # the job after a failure resumes rather than duplicating.
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the Release and upload its assets
+
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131  # v7.0.0
+        with:
+          name: AutoNotes-dmg
+          path: dist
+
+      - name: Verify checksum
+        working-directory: dist
+        run: shasum -a 256 -c AutoNotes.dmg.sha256
+
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -89,7 +133,7 @@ jobs:
             || gh release create "$TAG" --draft --verify-tag --generate-notes
 
           for attempt in 1 2 3 4 5; do
-            if gh release upload "$TAG" dist/AutoNotes.dmg --clobber; then
+            if gh release upload "$TAG" dist/AutoNotes.dmg dist/AutoNotes.dmg.sha256 --clobber; then
               break
             fi
             if [ "$attempt" -eq 5 ]; then

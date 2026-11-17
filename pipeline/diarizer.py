@@ -1,5 +1,8 @@
+from pipeline._util import PipelineCancelled
+
+
 def diarize(audio_path: str, segments: list[dict], hf_token,
-            progress_cb=None, log_cb=None) -> list[dict]:
+            progress_cb=None, log_cb=None, cancel_check=None) -> list[dict]:
     """
     Add speaker labels to transcript segments using pyannote.audio.
     Falls back to a single 'Speaker' label if token is missing or diarization fails.
@@ -24,7 +27,22 @@ def diarize(audio_path: str, segments: list[dict], hf_token,
         if progress_cb:
             progress_cb(30)
 
-        output = pipeline(audio_path)
+        # pyannote calls the hook between its internal steps and per batch
+        # within them. It is the only place a cancel can be noticed: without
+        # it, Cancel did nothing for the whole of a long recording's diarization.
+        # Each internal step counts 0..total afresh, so only ever move forward.
+        furthest = [30]
+
+        def hook(step_name, step_artifact, file=None, total=None, completed=None):
+            if cancel_check:
+                cancel_check()
+            if progress_cb and total and completed is not None:
+                pct = 30 + int(min(completed / total, 1.0) * 50)
+                if pct > furthest[0]:
+                    furthest[0] = pct
+                    progress_cb(pct)
+
+        output = pipeline(audio_path, hook=hook)
         # pyannote 4 returns a DiarizeOutput; its exclusive (non-overlapping)
         # view gives each moment exactly one speaker, which is what a
         # transcript segment needs. Other pipelines return the Annotation itself.
@@ -45,6 +63,8 @@ def diarize(audio_path: str, segments: list[dict], hf_token,
 
         return result
 
+    except PipelineCancelled:
+        raise
     except Exception as e:
         # Non-fatal: fall back to unlabeled, but tell the user why
         if log_cb:

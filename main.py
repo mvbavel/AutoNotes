@@ -17,7 +17,6 @@
 # with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 # Bundled third-party components: see THIRD-PARTY-NOTICES.md
-import os
 import sys
 
 # Configure TLS trust before any ssl/network import and before the --yt-dlp
@@ -43,13 +42,15 @@ except Exception:
 # executable with --yt-dlp, so the bundled yt_dlp package works on machines
 # without a system yt-dlp install. Must run before any Qt import.
 if len(sys.argv) > 1 and sys.argv[1] == "--yt-dlp":
-    sys.argv = ["yt-dlp"] + sys.argv[2:]
+    sys.argv = ["yt-dlp", *sys.argv[2:]]
     from yt_dlp import main as ytdlp_main
     ytdlp_main()  # exits the process
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QFont
 
+from pipeline._util import kill_active_processes
+from pipeline.worker import sweep_stale_temp_dirs
 from ui.main_window import MainWindow
 
 
@@ -58,6 +59,10 @@ def main():
     app.setApplicationName("AutoNotes")
     app.setOrganizationName("AutoNotes")
     app.setFont(QFont("Helvetica Neue", 12))
+    # A crash or force-quit skips the worker's cleanup, leaving a full copy of
+    # the recording in the temp folder; clear any such leftovers
+    sweep_stale_temp_dirs()
+    app.aboutToQuit.connect(kill_active_processes)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

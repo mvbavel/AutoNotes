@@ -1,8 +1,9 @@
 import os
-import subprocess
 import time
+from collections import deque
 
 from pipeline._paths import FFMPEG
+from pipeline._util import run_streaming
 
 # Rough realtime factors: transcription time ≈ audio duration × RTF, measured
 # on Apple-Silicon CPU (int8, beam 5, word timestamps). Only used for the
@@ -26,30 +27,30 @@ def extract_audio(video_path: str, temp_dir: str, progress_cb=None, cancel_check
         "-nostats", "-loglevel", "error",
         audio_path
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    try:
-        while proc.poll() is None:
-            if cancel_check:
-                cancel_check()
-            time.sleep(0.2)
-    except Exception:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait()
-        raise
-    if proc.returncode != 0:
-        stderr = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
-        raise RuntimeError(f"Audio extraction failed: {stderr}")
+    # ffmpeg is at -loglevel error, so anything it prints is the reason it failed
+    errors = deque(maxlen=20)
+    returncode = run_streaming(cmd, on_line=lambda line: errors.append(line.rstrip()),
+                               cancel_check=cancel_check)
+    if returncode != 0:
+        detail = " ".join(line for line in errors if line)
+        if "does not contain any stream" in detail or "matches no streams" in detail:
+            raise RuntimeError(
+                "This recording has no audio track, so there is nothing to transcribe.")
+        raise RuntimeError(f"Audio extraction failed: {detail}")
     if progress_cb:
         progress_cb(100)
     return audio_path
 
 
 def transcribe(audio_path: str, model_size: str = "medium",
-               progress_cb=None, cancel_check=None, log_cb=None) -> list[dict]:
+               progress_cb=None, cancel_check=None, log_cb=None,
+               eta_cb=None) -> list[dict]:
     """
     Transcribe audio using faster-whisper.
     Returns list of {start, end, text} dicts.
+
+    eta_cb receives a short "about 14m left" string as the estimate firms up,
+    so the UI can show it on the stage row instead of only in the log.
     """
     from faster_whisper import WhisperModel
 
@@ -109,6 +110,8 @@ def transcribe(audio_path: str, model_size: str = "medium",
             remaining = (duration - seg.end) * (elapsed / seg.end)
             log_cb(f"Transcribing: {min(int(audio_pct), 100)}% — "
                    f"{_fmt_secs(elapsed)} elapsed, ~{_fmt_secs(remaining)} remaining")
+            if eta_cb and remaining >= 1:
+                eta_cb(f"about {_fmt_secs(remaining)} left")
             while next_decile <= audio_pct:
                 next_decile += 10
 

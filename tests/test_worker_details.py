@@ -30,6 +30,7 @@ class TestStageDetails(unittest.TestCase):
         patches = [
             patch.object(worker, "DEBUG_DIR", tmp),
             patch.object(worker, "check_output_dir", return_value=None),
+            patch.object(worker, "check_api_key", return_value=None),
             patch.object(worker, "extract_audio", return_value=os.path.join(tmp, "a.wav")),
             patch.object(worker, "transcribe", return_value=[dict(s) for s in _SEGMENTS]),
             patch.object(worker, "diarize", side_effect=lambda a, segs, tok, **k: segs),

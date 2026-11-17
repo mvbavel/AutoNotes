@@ -1,8 +1,11 @@
 import base64
+import importlib
 import json
 import os
 import re
 import time
+
+from pipeline._util import clean_text, private_dir, write_private
 
 
 MODEL = os.environ.get("AUTONOTES_MODEL", "claude-sonnet-5")
@@ -24,6 +27,35 @@ _MIN_BOX_AREA = 0.25
 # Raw model responses land here for post-hoc debugging (same dir the worker
 # uses for its log and frame copies)
 _DEBUG_DIR = os.path.expanduser("~/Library/Logs/AutoNotes")
+
+
+def check_api_key(api_key: str) -> str | None:
+    """Fail in seconds, not at stage 6, when the key or model can't be used.
+
+    The Claude call is the second-to-last stage, so a mistyped key used to
+    surface only after the download and a possibly hour-long transcription.
+    Retrieving the model is free and exercises both the key and the model ID.
+
+    Raises on a definite rejection (the worker reports it like any other
+    failure). Returns a note for the log, or None, when the check could not be
+    completed — being offline now is not a reason to refuse a run whose Claude
+    call is still minutes away and has its own retries.
+    """
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=api_key, max_retries=0, timeout=15.0)
+    try:
+        client.models.retrieve(MODEL)
+    except (anthropic.AuthenticationError, anthropic.PermissionDeniedError):
+        raise
+    except anthropic.NotFoundError:
+        raise RuntimeError(
+            f"The Claude model '{MODEL}' isn't available to this API key. "
+            "Check the AUTONOTES_MODEL setting, or your account's model access."
+        ) from None
+    except Exception as e:
+        return f"Couldn't check the API key ahead of time ({type(e).__name__}) — continuing"
+    return None
 
 
 def generate_notes(
@@ -108,6 +140,7 @@ def _generate_chunked(
     all_chapters = []
     all_boxes: dict = {}
     title = video_title
+    degraded = ""
 
     for i, (chunk_segs, chunk_frames) in enumerate([
         (chunk1_segs, chunk1_frames),
@@ -141,6 +174,8 @@ def _generate_chunked(
 
         if i == 0:
             title = chunk_notes.get("title", video_title)
+        if chunk_notes.get("degraded"):
+            degraded = chunk_notes["degraded"]
 
         all_chapters.extend(chunk_notes.get("chapters", []))
         all_boxes.update(chunk_notes.get("screenshot_boxes", {}))
@@ -151,7 +186,10 @@ def _generate_chunked(
     if not all_chapters:
         return _fallback_notes(video_title, segments)
 
-    return {"title": title, "chapters": all_chapters, "screenshot_boxes": all_boxes}
+    notes = {"title": title, "chapters": all_chapters, "screenshot_boxes": all_boxes}
+    if degraded:
+        notes["degraded"] = degraded + " for part of the recording"
+    return notes
 
 
 # Error types worth retrying that the SDK raises as a bare APIStatusError:
@@ -161,11 +199,27 @@ _RETRYABLE_STREAM_ERRORS = {"overloaded_error", "api_error", "rate_limit_error",
                             "timeout_error"}
 
 
+def _transport_errors() -> tuple:
+    """TransportError base class(es) of whichever HTTP library the SDK uses.
+
+    anthropic 0.x sits on httpx; 1.x and later sit on httpx2, whose exceptions
+    share no base class with httpx's. Catching only httpx.TransportError keeps
+    importing and keeps passing tests after an SDK upgrade while no longer
+    matching anything the SDK raises — so look for both.
+    """
+    found = []
+    for name in ("httpx", "httpx2"):
+        try:
+            found.append(importlib.import_module(name).TransportError)
+        except (ImportError, AttributeError):
+            pass
+    return tuple(found)
+
+
 def _is_retryable(exc) -> bool:
     import anthropic
-    import httpx
 
-    # httpx.TransportError covers mid-stream failures (ReadError on a TCP
+    # TransportError covers mid-stream failures (ReadError on a TCP
     # reset, timeouts, RemoteProtocolError) that the SDK does NOT wrap in
     # APIConnectionError once the stream is being iterated — without it a
     # network blip minutes into a response kills the whole pipeline.
@@ -174,7 +228,7 @@ def _is_retryable(exc) -> bool:
                         anthropic.InternalServerError,
                         anthropic.OverloadedError,
                         anthropic.APIConnectionError,
-                        httpx.TransportError)):
+                        *_transport_errors())):
         return True
     # An error event mid-stream arrives on the already-200 response, so the
     # SDK can't map it to a typed subclass — classify by the event body
@@ -245,22 +299,119 @@ def _parse_response(response, video_title: str, segments: list[dict],
         if log_cb:
             log_cb(f"Claude response ({tag}) contained no text block "
                    f"(stop_reason={stop}, blocks={blocks}) — using fallback notes")
-        return _fallback_notes(video_title, segments)
-    raw = raw.strip()
+        return _fallback_notes(video_title, segments,
+                               "Claude declined to write notes for this recording"
+                               if stop == "refusal" else "Claude returned no notes")
     _dump_debug(raw, tag)
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[1]
-        raw = raw.rsplit("```", 1)[0]
     try:
-        notes = json.loads(raw)
-    except json.JSONDecodeError:
+        notes = _extract_json(raw)
+    except ValueError:
+        truncated = stop == "max_tokens"
         if log_cb:
-            truncated = " (response truncated at max_tokens)" if stop == "max_tokens" else ""
-            log_cb(f"Claude response ({tag}) was not valid JSON{truncated} — using "
+            log_cb(f"Claude response ({tag}) was not valid JSON"
+                   + (" (response truncated at max_tokens)" if truncated else "")
+                   + f" — using fallback notes (raw saved to {_DEBUG_DIR})")
+        return _fallback_notes(video_title, segments,
+                               "Claude's reply was cut off" if truncated
+                               else "Claude's reply couldn't be read")
+    notes = _normalize_notes(notes, video_title)
+    if notes is None:
+        if log_cb:
+            log_cb(f"Claude response ({tag}) had no usable chapters — using "
                    f"fallback notes (raw saved to {_DEBUG_DIR})")
-        return _fallback_notes(video_title, segments)
+        return _fallback_notes(video_title, segments, "Claude's reply had no chapters")
     notes = _normalize_screenshot_refs(notes, valid_idx, log_cb=log_cb, tag=tag)
     return _normalize_content_boxes(notes, valid_idx)
+
+
+_FENCE = re.compile(r"^```[A-Za-z0-9_-]*\s*(.*?)\s*```$", re.S)
+
+
+def _extract_json(raw: str):
+    """Parse the model's reply, tolerating a code fence or a sentence before it.
+
+    The prompt asks for bare JSON, but "Here are the notes:" in front of an
+    otherwise perfect reply used to discard the whole thing.
+    Raises ValueError when there is no JSON value to be had.
+    """
+    text = raw.strip()
+    fenced = _FENCE.match(text)
+    if fenced:
+        text = fenced.group(1)
+    try:
+        return json.loads(text)
+    except ValueError:
+        start = text.find("{")
+        if start == -1:
+            raise
+        value, _ = json.JSONDecoder().raw_decode(text, start)
+        return value
+
+
+def _normalize_notes(notes, video_title: str) -> dict | None:
+    """Coerce the model's JSON into the exact shape the document writer reads.
+
+    The reply is model output, not a validated schema: a chapter can arrive
+    without a title, key points as bare strings, speakers as null. Each of
+    those used to crash the final stage — after the download, the
+    transcription and the paid API call. Returns None when nothing usable is
+    left, so the caller falls back to the transcript.
+    """
+    if not isinstance(notes, dict):
+        return None
+    raw_chapters = notes.get("chapters")
+    if not isinstance(raw_chapters, list):
+        return None
+
+    chapters = []
+    for raw in raw_chapters:
+        if not isinstance(raw, dict):
+            continue
+        key_points = []
+        raw_points = raw.get("key_points")
+        for point in raw_points if isinstance(raw_points, list) else []:
+            if isinstance(point, str):
+                point = {"text": point}
+            if not isinstance(point, dict):
+                continue
+            text = clean_text(point.get("text")).strip()
+            idx = point.get("screenshot_idx")
+            if text or idx is not None:
+                key_points.append({"text": text, "screenshot_idx": idx})
+        if not key_points:
+            continue
+        speakers = raw.get("speakers")
+        if isinstance(speakers, str):
+            speakers = [speakers]
+        chapters.append({
+            "title": clean_text(raw.get("title")).strip() or f"Part {len(chapters) + 1}",
+            "start_time": _to_seconds(raw.get("start_time")),
+            "end_time": _to_seconds(raw.get("end_time")),
+            "speakers": [clean_text(sp).strip() for sp in speakers
+                         if isinstance(sp, (str, int, float)) and str(sp).strip()]
+                        if isinstance(speakers, list) else [],
+            "key_points": key_points,
+        })
+    if not chapters:
+        return None
+
+    result = {
+        "title": clean_text(notes.get("title")).strip() or video_title,
+        "chapters": chapters,
+    }
+    if "screenshots" in notes:
+        result["screenshots"] = notes["screenshots"]   # validated by _normalize_content_boxes
+    return result
+
+
+def _to_seconds(value) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds >= 0 and seconds == seconds else None   # drop negatives and NaN
 
 
 def _normalize_screenshot_refs(notes: dict, valid_idx: set | None,
@@ -336,10 +487,8 @@ def _coerce_idx(value):
 def _dump_debug(text: str, tag: str):
     """Save the raw model output so citation problems can be diagnosed post-hoc."""
     try:
-        os.makedirs(_DEBUG_DIR, exist_ok=True)
-        path = os.path.join(_DEBUG_DIR, f"last_claude_{tag}.json")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
+        private_dir(_DEBUG_DIR)
+        write_private(os.path.join(_DEBUG_DIR, f"last_claude_{tag}.json"), text)
     except OSError:
         pass
 
@@ -425,19 +574,47 @@ def _encode_image(path: str):
         return None
 
 
-def _fallback_notes(title: str, segments: list[dict]) -> dict:
-    text = " ".join(s["text"] for s in segments)
+# Roughly a paragraph: long enough to read as prose, short enough to scan
+_FALLBACK_PARAGRAPH_CHARS = 700
+
+
+def _fallback_notes(title: str, segments: list[dict], reason: str = "") -> dict:
+    """The transcript itself, as a document, for when Claude's notes can't be used.
+
+    Marked "degraded" so the worker and UI say plainly that these are not AI
+    notes. It used to be the first 500 characters of the transcript under a
+    green "Notes saved" — a run that looked successful and wasn't.
+    """
+    paragraphs, current, current_speaker = [], "", None
+    for seg in segments:
+        speaker = seg.get("speaker") or "Speaker"
+        text = clean_text(seg.get("text")).strip()
+        if not text:
+            continue
+        if speaker != current_speaker or len(current) + len(text) > _FALLBACK_PARAGRAPH_CHARS:
+            if current:
+                paragraphs.append(current)
+            current = f"[{_format_ts(seg.get('start') or 0)}] {speaker}: {text}"
+            current_speaker = speaker
+        else:
+            current += " " + text
+    if current:
+        paragraphs.append(current)
+
     return {
         "title": title,
+        "degraded": reason or "Claude's reply couldn't be read",
         "chapters": [
             {
-                "title": "Full Content",
+                "title": "Transcript",
                 "start_time": 0,
-                "end_time": segments[-1]["end"] if segments else 0,
-                "speakers": list({s.get("speaker", "Speaker") for s in segments}),
-                "key_points": [{"text": text[:500], "screenshot_idx": None}],
+                "end_time": segments[-1].get("end", 0) if segments else 0,
+                "speakers": sorted({s.get("speaker") or "Speaker" for s in segments}),
+                "key_points": [{"text": p, "screenshot_idx": None}
+                               for p in paragraphs or ["(No transcript text.)"]],
             }
         ],
+        "screenshot_boxes": {},
     }
 
 

@@ -1,0 +1,12 @@
+# Coverage gate for CI (.github/workflows/build.yml).
+[run]
+branch = True
+source = pipeline, ui, output
+omit =
+    */__init__.py
+
+[report]
+skip_empty = True
+show_missing = True
+# Raise this as coverage grows; it exists so coverage can't silently slide back
+fail_under = 83

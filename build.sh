@@ -16,6 +16,14 @@ if ! "$PYTHON" -m PyInstaller --version >/dev/null 2>&1; then
     "$PYTHON" -m pip install --break-system-packages pyinstaller
 fi
 
+# Refuse to bundle dependencies that don't meet requirements.txt. The build
+# packs whatever this shared interpreter has, and nothing else checked it: a
+# DMG shipped with the yt-dlp that YouTube 403s, and with an anthropic version
+# the requirements excluded. pip's dry run lists anything it would change.
+echo "Checking build dependencies against requirements.txt…"
+"$PYTHON" scripts/check_deps.py
+"$PYTHON" -c 'from pipeline.ytdlp_health import staleness_warning as w; m = w(); print(f"Warning: {m}") if m else None'
+
 if [[ "${1:-}" == "--clean" ]]; then
     echo "Cleaning previous build artefacts…"
     rm -rf build dist __pycache__

@@ -20,13 +20,15 @@ permissions:
 
 jobs:
   rebuild:
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.14'
 
@@ -50,6 +52,8 @@ jobs:
           "
 
       - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: python3 -m unittest discover tests -v
 
       # The check that matters. A metadata fetch is not enough: when 2026.07.04
@@ -103,7 +107,7 @@ jobs:
       # shipment. Kept so a fresh build is on hand if this run is what reveals
       # that the released one has rotted.
       - name: Upload DMG artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: AutoNotes-dmg-monthly
           path: dist/AutoNotes.dmg

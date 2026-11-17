@@ -65,6 +65,7 @@ class MainWindowTestCase(unittest.TestCase):
             patch.object(mw, "save_secret"),
             patch.object(mw, "staleness_warning", return_value=None),
             patch.object(mw, "load_saved_transcript", return_value=([], {})),
+            patch.object(mw.MainWindow, "_notify"),
         ]
         for p in self._patches:
             p.start()
@@ -94,7 +95,7 @@ class TestInputSource(MainWindowTestCase):
         self.win.api_key_edit.setText("dummy")
         self.browse()
         self.assertTrue(self.win.process_btn.isEnabled())
-        self.assertIn("Ready", self.win.input_status.text())
+        self.assertIn("ready to generate", self.win.input_status.text())
 
     def test_browse_without_key_asks_for_key(self):
         self.browse()
