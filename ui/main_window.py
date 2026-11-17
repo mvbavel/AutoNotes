@@ -1,18 +1,27 @@
 import os
+import shutil
 import subprocess
 import time
 from datetime import datetime
+from urllib.parse import urlparse
 
 from PyQt6.QtCore import Qt, QSettings, QEvent, QPointF, QRectF, QTimer
-from PyQt6.QtGui import QFont, QColor, QPalette, QPainter, QPen, QPixmap
+from PyQt6.QtGui import (
+    QAction, QColor, QFont, QKeySequence, QPainter, QPalette, QPen, QPixmap,
+    QShortcut,
+)
 from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QLineEdit, QPushButton, QFileDialog,
+    QApplication, QMainWindow, QMessageBox, QWidget, QVBoxLayout, QHBoxLayout,
+    QGridLayout, QLabel, QLineEdit, QPushButton, QFileDialog,
     QComboBox, QTextEdit, QProgressBar, QGroupBox,
     QFormLayout, QSplitter, QFrame, QSizePolicy, QCheckBox,
 )
 
-from pipeline.worker import ProcessingWorker, load_saved_transcript
+from pipeline._util import kill_active_processes
+from pipeline.teams_downloader import is_teams_url
+from pipeline.worker import (
+    ProcessingWorker, clear_saved_data, load_saved_transcript, log_path,
+)
 from pipeline.ytdlp_health import staleness_warning
 from ui.messages import explain_error, format_duration
 from ui.secure_store import load_secret, save_secret
@@ -40,6 +49,19 @@ _STAGES = [
     ("Write notes with Claude", "writing notes with Claude"),
     ("Build document", "building the document"),
 ]
+
+# Share of the whole run each stage typically takes, for the overall bar. With
+# equal shares the bar read 34% while transcription — most of the wait — was
+# not yet half done. Skipped stages simply complete instantly.
+_STAGE_WEIGHTS = [14, 3, 48, 10, 10, 13, 2]
+
+# Everything ffmpeg can read that people actually record into. Audio-only
+# files work too; they just produce notes without screenshots.
+_MEDIA_EXTS = ("mp4", "m4v", "mov", "mkv", "webm", "avi", "mpeg", "mpg",
+               "m4a", "mp3", "wav", "aac")
+
+# Wait this long for a cancelled run to stop when the window is closed
+_CLOSE_WAIT_MS = 10_000
 
 # Whisper model sizes behind plain-language labels; the model name stays
 # visible because people who know Whisper will look for it
@@ -74,6 +96,19 @@ _FILLS = {
 }
 
 _ICON_PX = 14
+
+# Fire-and-forget helpers (`open`, notifications), kept so they are reaped
+_helpers: list = []
+
+
+def _spawn(cmd: list[str]) -> None:
+    """Start a short-lived helper without waiting for it."""
+    _helpers[:] = [p for p in _helpers if p.poll() is None]
+    try:
+        _helpers.append(subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+    except OSError:
+        pass
 
 
 def _stage_icon(state: str, color: QColor, dpr: float) -> QPixmap:
@@ -128,6 +163,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("AutoNotes")
         self.setMinimumSize(900, 680)
         self._worker = None
+        self._running = False
         self._local_file = ""
         self._out_path = ""
         self._current_stage = 1
@@ -140,15 +176,24 @@ class MainWindow(QMainWindow):
         self._stage_started = [0.0] * len(_STAGES)
         self._stage_elapsed = [0.0] * len(_STAGES)
         self._stage_pct = 0
+        self._stage_eta = ""
+        self._run_warnings: list[str] = []
+        self._stale_warning: str | None = None
+        self._keep_awake = None      # caffeinate child while a run is in progress
         # Ticks the active row's elapsed time; runs only while a stage is active
         self._clock = QTimer(self)
         self._clock.setInterval(1000)
         self._clock.timeout.connect(self._tick)
         self._total_stages = len(ProcessingWorker.STAGES)
         self._settings = QSettings("AutoNotes", "AutoNotes")
+        self._loading_settings = False
+        self.setAcceptDrops(True)
         self._build_ui()
+        self._build_menu()
         self._load_settings()
+        self._connect_autosave()
         self._warn_if_ytdlp_stale()
+        self._show_stale_banner()
 
     # ── Theming ──────────────────────────────────────────────────────────
 
@@ -220,6 +265,14 @@ class MainWindow(QMainWindow):
         self._set_tone(subtitle, "muted", 12)
         root.addWidget(subtitle)
 
+        # Persistent, unlike the log, which every run clears
+        self.stale_banner = QLabel("")
+        self.stale_banner.setWordWrap(True)
+        self.stale_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._set_tone(self.stale_banner, "warning", 12)
+        self.stale_banner.setVisible(False)
+        root.addWidget(self.stale_banner)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         # The native handle draws a lone grip dot mid-window; keep the drag area
         # but paint nothing
@@ -252,12 +305,15 @@ class MainWindow(QMainWindow):
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("Paste a Teams, SharePoint or YouTube link, or browse for a video file")
         self.url_edit.textChanged.connect(self._on_input_changed)
+        self.url_edit.returnPressed.connect(self._start_if_ready)
+        # A long SharePoint link otherwise shows only its URL-encoded tail
+        self.url_edit.editingFinished.connect(lambda: self.url_edit.setCursorPosition(0))
         row.addWidget(self.url_edit)
 
-        browse_btn = QPushButton("Browse…")
-        browse_btn.setMinimumWidth(90)
-        browse_btn.clicked.connect(self._browse_file)
-        row.addWidget(browse_btn)
+        self.browse_btn = QPushButton("Browse…")
+        self.browse_btn.setMinimumWidth(90)
+        self.browse_btn.clicked.connect(self._browse_file)
+        row.addWidget(self.browse_btn)
         layout.addLayout(row)
 
         # Shown only once a file is chosen; "No file selected" was a permanent
@@ -299,21 +355,29 @@ class MainWindow(QMainWindow):
         form.addRow("Transcription:", self.model_combo)
 
         hint = QLabel("More accurate transcription takes longer on this Mac.")
-        self._set_tone(hint, "muted", 10)
+        self._set_tone(hint, "muted", 11)
         form.addRow("", hint)
 
         self.reuse_transcript_check = QCheckBox("Reuse the last transcript instead of transcribing")
         form.addRow("", self.reuse_transcript_check)
 
         self.reuse_info_label = QLabel("")
-        self._set_tone(self.reuse_info_label, "muted", 10)
+        self._set_tone(self.reuse_info_label, "muted", 11)
         form.addRow("", self.reuse_info_label)
 
         # ── Microsoft Teams / Graph API (optional) ────────────────────────
-        teams_header = QLabel("Microsoft Teams (optional)")
-        self._set_tone(teams_header, "muted", 10, bold=True)
-        teams_header.setContentsMargins(0, 6, 0, 0)
-        form.addRow("", teams_header)
+        # Collapsed unless in use: most runs never need it, and two empty
+        # fields with a paragraph of explanation crowded the settings
+        self.teams_toggle = QPushButton("\u25b8 Microsoft Teams options")
+        self.teams_toggle.setFlat(True)
+        self.teams_toggle.setCheckable(True)
+        self.teams_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Link-coloured so it reads as something to click, not a caption
+        self.teams_toggle.setStyleSheet(
+            "QPushButton { text-align: left; padding: 2px 0; border: none; color: palette(link); }"
+            "QPushButton:disabled { color: palette(placeholder-text); }")
+        self.teams_toggle.toggled.connect(self._set_teams_visible)
+        form.addRow("", self.teams_toggle)
 
         self.ms_client_id_edit = QLineEdit()
         self.ms_client_id_edit.setPlaceholderText("Azure app client ID")
@@ -323,12 +387,22 @@ class MainWindow(QMainWindow):
         self.ms_join_url_edit.setPlaceholderText("Join link from the meeting's calendar invite")
         form.addRow("Join link:", self.ms_join_url_edit)
 
-        ms_hint = QLabel("Both add attendees and the Teams recap. "
-                         "The transcript comes from the recording either way.")
-        self._set_tone(ms_hint, "muted", 10)
-        form.addRow("", ms_hint)
+        self.ms_hint = QLabel("Both add attendees and the Teams recap. "
+                              "The transcript comes from the recording either way.")
+        self.ms_hint.setWordWrap(True)
+        self._set_tone(self.ms_hint, "muted", 11)
+        form.addRow("", self.ms_hint)
+        self._config_form = form
+        self._set_teams_visible(False)
 
         return box
+
+    def _set_teams_visible(self, visible: bool):
+        for field in (self.ms_client_id_edit, self.ms_join_url_edit, self.ms_hint):
+            self._config_form.setRowVisible(field, visible)
+        self.teams_toggle.setText(("\u25be" if visible else "\u25b8") + " Microsoft Teams options")
+        if self.teams_toggle.isChecked() != visible:
+            self.teams_toggle.setChecked(visible)
 
     def _build_output_group(self) -> QGroupBox:
         box = QGroupBox("Save to")
@@ -338,10 +412,10 @@ class MainWindow(QMainWindow):
         self.output_dir_edit.setPlaceholderText(os.path.expanduser("~/Desktop"))
         row.addWidget(self.output_dir_edit)
 
-        btn = QPushButton("Browse…")
-        btn.setMinimumWidth(90)
-        btn.clicked.connect(self._browse_output_dir)
-        row.addWidget(btn)
+        self.output_browse_btn = QPushButton("Browse…")
+        self.output_browse_btn.setMinimumWidth(90)
+        self.output_browse_btn.clicked.connect(self._browse_output_dir)
+        row.addWidget(self.output_browse_btn)
 
         return box
 
@@ -422,18 +496,73 @@ class MainWindow(QMainWindow):
         self.log_text.setFont(QFont("Menlo", 10))
         self.log_text.setFrameShape(QFrame.Shape.NoFrame)
         log_layout.addWidget(self.log_text)
+        # Errors say "the log has the details"; give a way to hand it over
+        log_actions = QHBoxLayout()
+        log_actions.addStretch()
+        copy_log_btn = QPushButton("Copy Log")
+        copy_log_btn.clicked.connect(self._copy_log)
+        log_actions.addWidget(copy_log_btn)
+        reveal_log_btn = QPushButton("Show Log File")
+        reveal_log_btn.clicked.connect(self._reveal_log)
+        log_actions.addWidget(reveal_log_btn)
+        log_layout.addLayout(log_actions)
         layout.addWidget(log_box, stretch=1)
 
-        # Open output button
+        # Open output buttons
+        done_row = QHBoxLayout()
         self.open_btn = QPushButton("Open Notes")
         self.open_btn.setFixedHeight(38)
         self.open_btn.setVisible(False)
         self.open_btn.clicked.connect(self._open_output)
-        layout.addWidget(self.open_btn)
+        done_row.addWidget(self.open_btn, stretch=1)
+        self.reveal_btn = QPushButton("Show in Finder")
+        self.reveal_btn.setFixedHeight(38)
+        self.reveal_btn.setVisible(False)
+        self.reveal_btn.clicked.connect(self._reveal_output)
+        done_row.addWidget(self.reveal_btn)
+        layout.addLayout(done_row)
 
         self._style_surfaces()
 
         return panel
+
+    def _build_menu(self):
+        """Standard Mac menus, so the usual shortcuts work."""
+        bar = self.menuBar()
+
+        file_menu = bar.addMenu("File")
+        self._add_action(file_menu, "Open Video…", QKeySequence.StandardKey.Open,
+                         self._browse_file)
+        self._add_action(file_menu, "Choose Save Folder…", "Ctrl+Shift+O",
+                         self._browse_output_dir)
+        file_menu.addSeparator()
+        self.open_notes_action = self._add_action(
+            file_menu, "Open Last Notes", "Ctrl+Shift+N", self._open_output)
+        self.open_notes_action.setEnabled(False)
+
+        run_menu = bar.addMenu("Run")
+        self.generate_action = self._add_action(
+            run_menu, "Generate Notes", "Ctrl+Return", self._start_if_ready)
+        self.cancel_action = self._add_action(
+            run_menu, "Cancel", "Ctrl+.", self._cancel_processing)
+        self.cancel_action.setEnabled(False)
+
+        help_menu = bar.addMenu("Help")
+        self._add_action(help_menu, "Copy Log", None, self._copy_log)
+        self._add_action(help_menu, "Show Log File", None, self._reveal_log)
+        help_menu.addSeparator()
+        self._add_action(help_menu, "Delete Saved Data…", None, self._confirm_clear_data)
+
+        # Escape cancels too, as in a Mac sheet
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self._cancel_processing)
+
+    def _add_action(self, menu, text, shortcut, slot) -> QAction:
+        action = QAction(text, self)
+        if shortcut is not None:
+            action.setShortcut(QKeySequence(shortcut))
+        action.triggered.connect(slot)
+        menu.addAction(action)
+        return action
 
     # ── Slots ────────────────────────────────────────────────────────────
 
@@ -443,14 +572,24 @@ class MainWindow(QMainWindow):
         if self.url_edit.text().strip() and self._local_file:
             self._set_local_file("")
 
-        has_input = bool(self.url_edit.text().strip()) or bool(self._local_file)
+        url = self.url_edit.text().strip()
+        has_input = bool(url) or bool(self._local_file)
         has_key = bool(self.api_key_edit.text().strip())
         ready = has_input and has_key
-        if not self._is_running():
-            self.process_btn.setEnabled(ready)
+        if self._is_running():
+            # "Ready to generate notes" under a running job read as an invitation
+            self.input_status.setText("")
+            return
+        self.process_btn.setEnabled(ready)
+        if hasattr(self, "generate_action"):
+            self.generate_action.setEnabled(ready)
 
-        if ready:
-            self.input_status.setText("Ready to generate notes.")
+        if url and not url.startswith(("http://", "https://")) and not os.path.isfile(url):
+            self.input_status.setText("Paste a link starting with https://, or use Browse.")
+            self._set_tone(self.input_status, "warning")
+        elif ready:
+            kind = _describe_source(url) if url else "Video file"
+            self.input_status.setText(f"{kind}, ready to generate notes.")
             self._set_tone(self.input_status, "success")
         elif has_input and not has_key:
             self.input_status.setText("Add your Claude API key to continue.")
@@ -459,7 +598,10 @@ class MainWindow(QMainWindow):
             self.input_status.setText("")
 
     def _is_running(self) -> bool:
-        return bool(self._worker and self._worker.isRunning())
+        # Our own flag, not QThread.isRunning(): the thread can still report
+        # running while its finished() signal is being handled, which left the
+        # Generate button disabled after a run
+        return self._running
 
     def _set_local_file(self, path: str):
         self._local_file = path
@@ -469,22 +611,67 @@ class MainWindow(QMainWindow):
         self.file_path_label.setVisible(bool(path))
 
     def _browse_file(self):
+        if self._is_running():
+            return
+        patterns = " ".join(f"*.{ext}" for ext in _MEDIA_EXTS)
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Video File", os.path.expanduser("~"),
-            "Video files (*.mp4 *.mpeg *.mpg *.mov *.avi *.mkv);;All files (*)"
+            self, "Select Recording", os.path.expanduser("~"),
+            f"Recordings ({patterns});;All files (*)"
         )
         if path:
-            # Clear the URL first: its textChanged must not see the new file
-            self.url_edit.clear()
-            self._set_local_file(path)
-            self._on_input_changed()
+            self._choose_file(path)
+
+    def _choose_file(self, path: str):
+        # Clear the URL first: its textChanged must not see the new file
+        self.url_edit.clear()
+        self._set_local_file(path)
+        self._on_input_changed()
+
+    # Drag a recording onto the window, or a link from the browser
+    def dragEnterEvent(self, event):
+        if not self._is_running() and self._dropped_source(event.mimeData()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        source = self._dropped_source(event.mimeData())
+        if not source or self._is_running():
+            return
+        kind, value = source
+        if kind == "file":
+            self._choose_file(value)
+        else:
+            self.url_edit.setText(value)
+            self.url_edit.setCursorPosition(0)
+        event.acceptProposedAction()
+
+    @staticmethod
+    def _dropped_source(mime):
+        if mime.hasUrls():
+            for url in mime.urls():
+                if url.isLocalFile():
+                    path = url.toLocalFile()
+                    if os.path.isfile(path) and path.lower().endswith(tuple("." + e for e in _MEDIA_EXTS)):
+                        return "file", path
+                elif url.scheme() in ("http", "https"):
+                    return "url", url.toString()
+        if mime.hasText():
+            text = mime.text().strip()
+            if text.startswith(("http://", "https://")) and "\n" not in text:
+                return "url", text
+        return None
+
+    def _start_if_ready(self):
+        if self.process_btn.isEnabled() and not self._is_running():
+            self._start_processing()
 
     def _browse_output_dir(self):
-        d = QFileDialog.getExistingDirectory(
-            self, "Select Output Folder", os.path.expanduser("~/Desktop")
-        )
+        if self._is_running():
+            return
+        start = self.output_dir_edit.text().strip() or os.path.expanduser("~/Desktop")
+        d = QFileDialog.getExistingDirectory(self, "Select Output Folder", start)
         if d:
             self.output_dir_edit.setText(d)
+            self._save_settings()
 
     def _start_processing(self):
         self._save_settings()
@@ -507,22 +694,61 @@ class MainWindow(QMainWindow):
         self._worker.stage_changed.connect(self._on_stage_changed)
         self._worker.stage_progress.connect(self._on_stage_progress)
         self._worker.stage_detail.connect(self._on_stage_detail)
+        self._worker.stage_eta.connect(self._on_stage_eta)
+        self._worker.warning.connect(self._on_warning)
         self._worker.log_message.connect(self._on_log)
         self._worker.completed.connect(self._on_completed)
         self._worker.error.connect(self._on_error)
         self._worker.finished.connect(self._set_idle)
 
         self.process_btn.setEnabled(False)
+        self.generate_action.setEnabled(False)
         self.cancel_btn.setVisible(True)
+        self.cancel_action.setEnabled(True)
         self.progress_bar.setVisible(True)
         self.open_btn.setVisible(False)
+        self.reveal_btn.setVisible(False)
+        self._set_inputs_locked(True)
+        self.input_status.setText("")
 
         self._run_started = time.monotonic()
+        self._running = True
         self._clock.start()
+        self._start_keep_awake()
         self._worker.start()
 
+    def _set_inputs_locked(self, locked: bool):
+        """Settings can't change mid-run: the worker already has its copy, so
+        an edit would silently not apply to this run."""
+        for w in (self.url_edit, self.browse_btn, self.api_key_edit, self.hf_token_edit,
+                  self.model_combo, self.reuse_transcript_check, self.teams_toggle,
+                  self.ms_client_id_edit, self.ms_join_url_edit,
+                  self.output_dir_edit, self.output_browse_btn):
+            w.setEnabled(not locked)
+        # A long SharePoint link otherwise shows only its URL-encoded tail
+        self.url_edit.setCursorPosition(0)
+        if not locked:
+            self._refresh_transcript_info()   # re-applies the checkbox's own rule
+
+    def _start_keep_awake(self):
+        """Stop the Mac idle-sleeping through an hour-long transcription."""
+        self._stop_keep_awake()
+        caffeinate = "/usr/bin/caffeinate"
+        if os.path.exists(caffeinate):
+            try:
+                # -w: exits by itself if AutoNotes dies, so it can't leak
+                self._keep_awake = subprocess.Popen(
+                    [caffeinate, "-i", "-w", str(os.getpid())])
+            except OSError:
+                self._keep_awake = None
+
+    def _stop_keep_awake(self):
+        proc, self._keep_awake = self._keep_awake, None
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+
     def _cancel_processing(self):
-        if self._worker and self._worker.isRunning():
+        if self._worker and self._worker.isRunning() and not self._cancel_requested:
             # Cooperative cancel: the worker checks the flag at safe points and
             # kills its subprocesses; _set_idle runs when the thread finishes
             self._worker.cancel()
@@ -530,6 +756,9 @@ class MainWindow(QMainWindow):
             self.cancel_btn.setText("Cancelling…")
             self._on_log("Cancelling — waiting for current step to stop…")
             self._cancel_requested = True
+            self.cancel_action.setEnabled(False)
+            # Don't wait for the next progress line: stop ffmpeg / yt-dlp now
+            kill_active_processes()
 
     def _render_stages(self):
         dpr = self.devicePixelRatioF() or 1.0
@@ -556,6 +785,8 @@ class MainWindow(QMainWindow):
             if 0 < self._stage_pct < 100:
                 parts.append(f"{self._stage_pct}%")
             parts.append(format_duration(elapsed))
+            if self._stage_eta:
+                parts.append(self._stage_eta)
             return ", ".join(parts)
         if self._stage_elapsed[i] < 1:
             return fact  # "0s" on instant stages is noise
@@ -583,13 +814,15 @@ class MainWindow(QMainWindow):
         self._stage_states[current - 1] = "active"
         self._stage_started[current - 1] = time.monotonic()
         self._stage_pct = 0
+        self._stage_eta = ""
         self._render_stages()
 
-        self.progress_bar.setValue(int(((current - 1) / total) * 100))
+        self.progress_bar.setValue(max(self.progress_bar.value(), _overall_pct(current, 0)))
 
     def _on_stage_progress(self, pct: int):
-        # Overall = completed stages + fractional progress of the current one
-        overall = int(((self._current_stage - 1) + pct / 100) / self._total_stages * 100)
+        # Overall = completed stages + fractional progress of the current one,
+        # each weighted by how long that stage usually takes
+        overall = _overall_pct(self._current_stage, pct)
         self.progress_bar.setValue(max(self.progress_bar.value(), overall))
         self._stage_pct = pct
         idx = self._current_stage - 1
@@ -600,6 +833,17 @@ class MainWindow(QMainWindow):
         self._stage_facts[i] = text
         self._stage_skipped[i] = skipped
         self._render_stages()
+
+    def _on_stage_eta(self, text: str):
+        self._stage_eta = text
+        idx = self._current_stage - 1
+        self.stage_details[idx].setText(self._stage_detail_text(idx))
+
+    def _on_warning(self, text: str):
+        """Something the user needs to see now, not find later in the log."""
+        if text not in self._run_warnings:
+            self._run_warnings.append(text)
+        self._set_run_status("\n".join(self._run_warnings), "warning")
 
     def _tick(self):
         idx = self._current_stage - 1
@@ -613,8 +857,13 @@ class MainWindow(QMainWindow):
         reads as a network fault rather than a version that needs updating.
         """
         warning = staleness_warning()
+        self._stale_warning = warning
         if warning:
             self._on_log(f"Warning: {warning}")
+
+    def _show_stale_banner(self):
+        self.stale_banner.setText(self._stale_warning or "")
+        self.stale_banner.setVisible(bool(self._stale_warning))
 
     def _on_log(self, msg: str):
         self.log_text.append(msg)
@@ -629,10 +878,21 @@ class MainWindow(QMainWindow):
         self._out_path = out_path
         self._run_finished = True
         took = format_duration(time.monotonic() - self._run_started) if self._run_started else ""
-        self._set_run_status(
-            f"Notes saved as {os.path.basename(out_path)}" + (f" in {took}." if took else "."),
-            "success")
+        saved = f"Notes saved as {os.path.basename(out_path)}" + (f" in {took}." if took else ".")
+        if self._run_warnings:
+            # A run that fell back to the transcript, or reused the wrong one,
+            # is not the same green success as a clean one
+            self._set_run_status("\n".join([saved, *self._run_warnings]), "warning")
+        else:
+            self._set_run_status(saved, "success")
         self.open_btn.setVisible(True)
+        self.reveal_btn.setVisible(True)
+        self.open_notes_action.setEnabled(True)
+        # Reusing is a one-off retry; left ticked, the next recording would
+        # silently get this one's transcript
+        if self.reuse_transcript_check.isChecked():
+            self.reuse_transcript_check.setChecked(False)
+        self._notify("Notes ready", os.path.basename(out_path))
 
     def _on_error(self, msg: str):
         self._on_log(f"\nERROR: {msg}")
@@ -641,11 +901,14 @@ class MainWindow(QMainWindow):
         self._close_stage(idx, "failed")
         self._render_stages()
         self.progress_bar.setFormat("Stopped")
-        self._set_run_status(explain_error(msg, _STAGES[idx][1]), "error")
+        explanation = explain_error(msg, _STAGES[idx][1])
+        self._set_run_status(explanation, "error")
         # The raw error stays reachable without being the headline
         self.run_status.setToolTip(msg)
+        self._notify("Couldn't make notes", explanation)
 
     def _set_idle(self):
+        self._running = False
         self._clock.stop()
         if self._cancel_requested and not self._run_finished:
             idx = self._current_stage - 1
@@ -656,8 +919,10 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setVisible(False)
         self.cancel_btn.setEnabled(True)
         self.cancel_btn.setText("Cancel")
-        self.process_btn.setEnabled(True)
-        self._refresh_transcript_info()
+        self.cancel_action.setEnabled(False)
+        self._stop_keep_awake()
+        self._set_inputs_locked(False)
+        self._on_input_changed()
 
     def _refresh_transcript_info(self):
         """Enable the reuse checkbox only when a saved transcript exists,
@@ -686,6 +951,8 @@ class MainWindow(QMainWindow):
         self._stage_skipped = [False] * n
         self._stage_elapsed = [0.0] * n
         self._stage_pct = 0
+        self._stage_eta = ""
+        self._run_warnings = []
         self._render_stages()
         self.run_status.setToolTip("")
         self._current_stage = 1
@@ -696,6 +963,7 @@ class MainWindow(QMainWindow):
         self._set_run_status("")
         self.log_text.clear()
         self.open_btn.setVisible(False)
+        self.reveal_btn.setVisible(False)
 
     def _select_model(self, model: str):
         idx = self.model_combo.findData(model)
@@ -703,32 +971,165 @@ class MainWindow(QMainWindow):
             self.model_combo.setCurrentIndex(idx)
 
     def _open_output(self):
-        if self._out_path:
-            subprocess.run(["open", self._out_path])
+        if self._out_path and os.path.exists(self._out_path):
+            # Popen: `open` can take a moment when Word is starting, and
+            # waiting on it froze the window
+            _spawn(["open", self._out_path])
+
+    def _reveal_output(self):
+        if self._out_path and os.path.exists(self._out_path):
+            _spawn(["open", "-R", self._out_path])
+
+    def _copy_log(self):
+        QApplication.clipboard().setText(self.log_text.toPlainText())
+        self.statusBar().showMessage("Log copied to the clipboard.", 3000)
+
+    def _reveal_log(self):
+        path = log_path()
+        if os.path.exists(path):
+            _spawn(["open", "-R", path])
+        else:
+            self.statusBar().showMessage("No log file yet.", 3000)
+
+    def _confirm_clear_data(self):
+        if self._is_running():
+            return
+        answer = QMessageBox.question(
+            self, "Delete saved data?",
+            "This deletes the log, the saved transcript, the last run's screenshots "
+            "and Claude responses, and your Microsoft sign-in.\n\n"
+            "Your notes documents, settings and API keys are kept.",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.Cancel)
+        if answer == QMessageBox.StandardButton.Yes:
+            clear_saved_data()
+            self._refresh_transcript_info()
+            self.log_text.clear()
+            self.statusBar().showMessage("Saved data deleted.", 4000)
+
+    def _notify(self, title: str, message: str):
+        """Tell someone who has switched away that the run has ended."""
+        # Offscreen means no one is looking at a screen (tests, the agent driver)
+        if self.isActiveWindow() or QApplication.platformName() == "offscreen":
+            return
+        QApplication.alert(self)   # Dock bounce
+        osascript = "/usr/bin/osascript"
+        if os.path.exists(osascript):
+            # Text goes in as argv, never spliced into the script
+            _spawn([osascript,
+                    "-e", "on run argv",
+                    "-e", "display notification (item 2 of argv) with title (item 1 of argv)",
+                    "-e", "end run",
+                    "--", f"AutoNotes: {title}", message[:200]])
+
+    def closeEvent(self, event):
+        """Don't let a close abandon a run: the worker would be killed mid-step,
+        leaving its temp folder (a full copy of the recording) behind."""
+        if self._is_running():
+            answer = QMessageBox.question(
+                self, "Stop and quit?",
+                "Notes are still being generated. Quitting stops the run and "
+                "nothing is saved.",
+                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+                QMessageBox.StandardButton.Cancel)
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            if not self._shutdown_worker():
+                # A step that can't be interrupted (loading a model) is still
+                # running. Destroying a live thread crashes Qt, and deleting its
+                # temp folder under it is unsafe, so finish quitting once it
+                # stops; its own cleanup then removes the temp folder.
+                event.ignore()
+                self.hide()
+                self._worker.finished.connect(QApplication.quit)
+                return
+        self._save_settings()
+        self._stop_keep_awake()
+        super().closeEvent(event)
+
+    def _shutdown_worker(self) -> bool:
+        """Cancel the run and wait for it. False if it is still running."""
+        worker = self._worker
+        if worker is None:
+            return True
+        self._save_settings()
+        worker.cancel()
+        kill_active_processes()
+        if not worker.wait(_CLOSE_WAIT_MS):
+            return False
+        # The worker's own cleanup has run; this only covers it failing
+        if worker.temp_dir:
+            shutil.rmtree(worker.temp_dir, ignore_errors=True)
+        return True
 
     # ── Settings persistence ─────────────────────────────────────────────
 
+    def _connect_autosave(self):
+        """Save each setting as it changes, not only when Generate is clicked —
+        a key typed in and the app quit was otherwise lost."""
+        for edit in (self.api_key_edit, self.hf_token_edit, self.output_dir_edit,
+                     self.ms_client_id_edit, self.ms_join_url_edit):
+            edit.editingFinished.connect(self._save_settings)
+        self.model_combo.currentIndexChanged.connect(self._save_settings)
+
     def _save_settings(self):
+        if self._loading_settings:
+            return
         s = self._settings
-        save_secret(s, "api_key", self.api_key_edit.text())
-        save_secret(s, "hf_token", self.hf_token_edit.text())
+        in_keychain = all([
+            save_secret(s, "api_key", self.api_key_edit.text()) is not False,
+            save_secret(s, "hf_token", self.hf_token_edit.text()) is not False,
+        ])
         s.setValue("whisper_model", self.model_combo.currentData())
         s.setValue("output_dir", self.output_dir_edit.text())
         s.setValue("ms_client_id", self.ms_client_id_edit.text())
         s.setValue("ms_join_url", self.ms_join_url_edit.text())
+        if not in_keychain and not getattr(self, "_warned_keychain", False):
+            self._warned_keychain = True
+            self._on_log("Warning: the macOS Keychain couldn't be used, so your API "
+                         "keys are saved in AutoNotes' preferences file instead.")
 
     def _load_settings(self):
-        s = self._settings
-        self.api_key_edit.setText(load_secret(s, "api_key"))
-        self.hf_token_edit.setText(load_secret(s, "hf_token"))
-        self._select_model(s.value("whisper_model", "medium"))
-        self.output_dir_edit.setText(s.value("output_dir", ""))
-        self.ms_client_id_edit.setText(s.value("ms_client_id", ""))
-        self.ms_join_url_edit.setText(s.value("ms_join_url", ""))
-        # setText leaves the view scrolled to the end, which shows the meeting
-        # token; show the recognisable teams.microsoft.com start instead
-        self.ms_join_url_edit.setCursorPosition(0)
+        self._loading_settings = True
+        try:
+            s = self._settings
+            self.api_key_edit.setText(load_secret(s, "api_key"))
+            self.hf_token_edit.setText(load_secret(s, "hf_token"))
+            self._select_model(s.value("whisper_model", "medium"))
+            self.output_dir_edit.setText(s.value("output_dir", ""))
+            self.ms_client_id_edit.setText(s.value("ms_client_id", ""))
+            self.ms_join_url_edit.setText(s.value("ms_join_url", ""))
+            # setText leaves the view scrolled to the end, which shows the meeting
+            # token; show the recognisable teams.microsoft.com start instead
+            self.ms_join_url_edit.setCursorPosition(0)
+            self._set_teams_visible(bool(self.ms_client_id_edit.text().strip()
+                                         or self.ms_join_url_edit.text().strip()))
+        finally:
+            self._loading_settings = False
 
         # Refresh button state based on loaded settings
         self._on_input_changed()
         self._refresh_transcript_info()
+
+
+def _overall_pct(stage: int, stage_pct: int) -> int:
+    """Whole-run progress from the current stage (1-based) and its own 0-100."""
+    done = sum(_STAGE_WEIGHTS[:stage - 1])
+    current = _STAGE_WEIGHTS[stage - 1] * max(0, min(100, stage_pct)) / 100
+    return int((done + current) / sum(_STAGE_WEIGHTS) * 100)
+
+
+def _describe_source(url: str) -> str:
+    """What kind of recording a link is, for the status line under it."""
+    if is_teams_url(url):
+        return "Teams or SharePoint recording"
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return "Link"
+    if host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com"):
+        return "YouTube video"
+    if os.path.isfile(url):
+        return "Video file"
+    return "Web video"

@@ -55,7 +55,8 @@ class TestParseResponse(unittest.TestCase):
         logs = []
         notes = note_generator._parse_response(resp, "vid", segments,
                                                valid_idx={1}, log_cb=logs.append)
-        self.assertEqual(notes["chapters"][0]["title"], "Full Content")
+        self.assertEqual(notes["chapters"][0]["title"], "Transcript")
+        self.assertIn("degraded", notes)
         self.assertTrue(any("no text block" in m for m in logs))
 
     def test_invalid_json_falls_back_and_dumps(self):
@@ -63,7 +64,8 @@ class TestParseResponse(unittest.TestCase):
         segments = [{"start": 0, "end": 2, "text": "hello"}]
         notes = note_generator._parse_response(resp, "vid", segments,
                                                valid_idx={1}, tag="unittest")
-        self.assertEqual(notes["chapters"][0]["title"], "Full Content")
+        self.assertEqual(notes["chapters"][0]["title"], "Transcript")
+        self.assertIn("degraded", notes)
         dump = os.path.join(self._tmp.name, "last_claude_unittest.json")
         self.assertTrue(os.path.isfile(dump))
 

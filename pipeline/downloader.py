@@ -1,13 +1,16 @@
 import glob
 import json
 import os
-import re
 import subprocess
 from collections import deque
 
 from pipeline import kaltura
 from pipeline._paths import FFMPEG, YTDLP_FRAGMENT_ARGS, ytdlp_command
-from pipeline._util import PipelineCancelled, safe_filename
+from pipeline._util import (
+    PipelineCancelled, find_video, run_capture, run_streaming, safe_filename,
+    ytdlp_template,
+)
+from pipeline.download_progress import DownloadProgress
 from pipeline.vtt_parser import parse_srt
 from pipeline.ytdlp_health import diagnose
 
@@ -34,12 +37,12 @@ def download_youtube(
     Also attempts to download subtitles (manual then auto-generated) as SRT files
     alongside the video. Callers can look for *.srt files in output_dir afterward.
     """
-    url, info = _resolve_metadata(url, log_cb)
+    url, info = _resolve_metadata(url, log_cb, cancel_check)
     title = info.get("title", "video")
     description = info.get("description", "") or ""
     chapters = info.get("chapters") or []
     safe_title = safe_filename(title)
-    out_template = os.path.join(output_dir, f"{safe_title}.%(ext)s")
+    out_template = ytdlp_template(output_dir, safe_title)
 
     ffmpeg_dir = os.path.dirname(FFMPEG)
     dl_args = [
@@ -58,41 +61,22 @@ def download_youtube(
         "-o", out_template,
         url,
     ]
-    proc = subprocess.Popen(
-        dl_args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
     # Kept so a failure can be explained: yt-dlp reports an aged-out extractor
     # as a transport or format error, and the exit code alone says nothing.
     tail = deque(maxlen=40)
-    try:
-        for line in proc.stdout:
-            if cancel_check:
-                cancel_check()
-            line = line.rstrip()
-            if not line:
-                continue
-            tail.append(line)
-            m = re.search(r"(\d+(?:\.\d+)?)%", line)
-            if m:
-                pct = min(int(float(m.group(1))), 100)
-                if progress_cb:
-                    progress_cb(pct)
-                if log_cb:
-                    log_cb(f"Downloading: {m.group(1)}%")
-            elif log_cb and not line.startswith("[debug]"):
-                log_cb(line)
-        proc.wait()
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait()
-    if proc.returncode != 0:
+    # The video is most of this stage; the subtitle fetch after it is quick
+    reporter = DownloadProgress(log_cb=log_cb, progress_cb=progress_cb, ceiling=95)
+
+    def on_line(line: str) -> None:
+        if line.strip():
+            tail.append(line.rstrip())
+        reporter.feed(line)
+
+    returncode = run_streaming(dl_args, on_line=on_line, cancel_check=cancel_check)
+    if returncode != 0:
         hint = diagnose(tail)
         raise RuntimeError(
-            f"yt-dlp exited with code {proc.returncode}" + (f". {hint}" if hint else "")
+            f"yt-dlp exited with code {returncode}. " + (hint or _last_error(tail))
         )
 
     out_path = _find_output(output_dir, safe_title)
@@ -104,19 +88,30 @@ def download_youtube(
     return out_path, title, description, chapters
 
 
-def _resolve_metadata(url: str, log_cb=None) -> tuple[str, dict]:
+def _resolve_metadata(url: str, log_cb=None, cancel_check=None) -> tuple[str, dict]:
     """Return (url to download, metadata) for the first candidate yt-dlp accepts."""
     *alternatives, original = kaltura.candidate_urls(url)
     for candidate in alternatives:
         try:
-            info = _run_json(YTDLP_CMD + _BASE_ARGS + ["--dump-single-json", candidate])
+            info = _run_json(YTDLP_CMD + _BASE_ARGS + ["--dump-single-json", candidate],
+                             cancel_check)
         except RuntimeError:
             continue
         if log_cb:
             log_cb(f"Resolved Kaltura player page to {candidate}")
         return candidate, info
     # Last so a total failure reports the user's URL, not a synthesised one.
-    return original, _run_json(YTDLP_CMD + _BASE_ARGS + ["--dump-single-json", original])
+    return original, _run_json(
+        YTDLP_CMD + _BASE_ARGS + ["--dump-single-json", original], cancel_check)
+
+
+def _last_error(tail) -> str:
+    """The most useful line of yt-dlp's output for an undiagnosed failure."""
+    lines = [line for line in tail if line.strip()]
+    for line in reversed(lines):
+        if line.startswith("ERROR"):
+            return line
+    return lines[-1] if lines else "Check the link opens in your browser, then try again."
 
 
 def _pick_sub_lang(info: dict) -> str | None:
@@ -168,22 +163,8 @@ def _download_subtitles(
         url,
     ]
     try:
-        proc = subprocess.Popen(
-            sub_args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        try:
-            for _ in proc.stdout:
-                if cancel_check:
-                    cancel_check()
-            proc.wait()
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
-        if proc.returncode != 0 and log_cb:
+        returncode = run_streaming(sub_args, cancel_check=cancel_check)
+        if returncode != 0 and log_cb:
             log_cb("Subtitle download failed; will transcribe with Whisper instead.")
     except PipelineCancelled:
         raise
@@ -194,11 +175,7 @@ def _download_subtitles(
 
 def _find_output(output_dir: str, safe_title: str) -> str | None:
     """Locate the downloaded video (container depends on the merged codecs)."""
-    for ext in ("mp4", "mkv", "webm", "mov"):
-        candidate = os.path.join(output_dir, f"{safe_title}.{ext}")
-        if os.path.exists(candidate):
-            return candidate
-    return None
+    return find_video(output_dir, safe_title)
 
 
 def find_transcript(output_dir: str) -> list[dict] | None:
@@ -209,15 +186,16 @@ def find_transcript(output_dir: str) -> list[dict] | None:
     srt_files = glob.glob(os.path.join(output_dir, "*.srt"))
     if not srt_files:
         return None
-    segments = parse_srt(srt_files[0])
+    segments = parse_srt(sorted(srt_files)[0])
     return segments if segments else None
 
 
-def _run_json(cmd: list[str]) -> dict:
+def _run_json(cmd: list[str], cancel_check=None) -> dict:
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=_METADATA_TIMEOUT)
+        result = run_capture(cmd, timeout=_METADATA_TIMEOUT, cancel_check=cancel_check)
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"yt-dlp metadata fetch timed out after {_METADATA_TIMEOUT}s")
+        raise RuntimeError(
+            f"yt-dlp metadata fetch timed out after {_METADATA_TIMEOUT}s") from None
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "yt-dlp metadata fetch failed")
     # Find the JSON line (last non-empty line)

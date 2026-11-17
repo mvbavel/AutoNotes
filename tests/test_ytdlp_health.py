@@ -153,9 +153,17 @@ class TestDownloaderIntegration(unittest.TestCase):
         self.assertIn("403", msg)
         self.assertIn("yt-dlp", msg)
 
-    def test_unrelated_failure_keeps_the_bare_error(self):
-        msg = self._run_failing_download(["ERROR: No space left on device"])
-        self.assertEqual(msg, "yt-dlp exited with code 1")
+    def test_unrelated_failure_reports_the_real_error_not_the_version(self):
+        # An unrecognised failure must not be blamed on yt-dlp's age, but the
+        # user still needs yt-dlp's own last word — a bare exit code says nothing
+        msg = self._run_failing_download(
+            ["[download] Destination: x.mp4", "ERROR: No space left on device"])
+        self.assertEqual(msg, "yt-dlp exited with code 1. ERROR: No space left on device")
+        self.assertNotIn("days old", msg)
+
+    def test_silent_failure_still_says_what_to_do(self):
+        msg = self._run_failing_download([])
+        self.assertIn("Check the link opens in your browser", msg)
 
 
 class TestUiIntegration(unittest.TestCase):

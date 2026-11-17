@@ -32,10 +32,12 @@ class TestSourceBlock(unittest.TestCase):
         self.assertIn("Recording:", text)
         self.assertIn("Line one.", text)
         self.assertIn("Line two.", text)
-        # URL is a real external hyperlink relationship
-        rels = [r for r in doc.part.rels.values() if r.reltype == RT.HYPERLINK]
-        self.assertEqual(len(rels), 1)
-        self.assertEqual(rels[0].target_ref, "https://youtu.be/abc123")
+        # URL is a real external hyperlink relationship; the chapter's start
+        # time links into the video at that moment
+        targets = sorted(r.target_ref for r in doc.part.rels.values()
+                         if r.reltype == RT.HYPERLINK)
+        self.assertEqual(targets, ["https://youtu.be/abc123",
+                                   "https://youtu.be/abc123?t=0s"])
 
     def test_local_file_path_is_plain_text(self):
         doc = _build({"type": "Local file",

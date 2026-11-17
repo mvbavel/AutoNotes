@@ -65,7 +65,7 @@ class TestDownloaderUsesResolvedUrl(unittest.TestCase):
     def test_skips_rejected_partner_and_downloads_resolved_url(self):
         calls = []
 
-        def fake_run_json(cmd):
+        def fake_run_json(cmd, cancel_check=None):
             calls.append(cmd[-1])
             if cmd[-1] == "kaltura:1921661:1_o683wj9q":
                 raise RuntimeError("Kaltura said: Invalid entry id")
@@ -86,7 +86,7 @@ class TestDownloaderUsesResolvedUrl(unittest.TestCase):
         self.assertEqual(subs.call_args[0][0], "kaltura:1936251:1_o683wj9q")
 
     def test_reports_original_error_when_every_candidate_fails(self):
-        def fake_run_json(cmd):
+        def fake_run_json(cmd, cancel_check=None):
             raise RuntimeError(f"failed {cmd[-1]}")
 
         with patch.object(downloader, "_run_json", side_effect=fake_run_json), \

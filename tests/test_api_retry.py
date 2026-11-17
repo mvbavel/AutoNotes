@@ -74,6 +74,21 @@ class TestCallWithRetry(unittest.TestCase):
         self.assertEqual(client.attempts, 2)
         self.assertTrue(any("retrying" in m for m in logs))
 
+    def test_sdk_native_transport_error_is_retried(self):
+        # anthropic 1.x+ raises httpx2 exceptions, which share no base class
+        # with httpx's. Faking the drop with httpx.ReadError (as above) passes
+        # even when the real SDK's errors would not be matched.
+        try:
+            import httpx2
+        except ImportError:
+            self.skipTest("SDK on httpx; covered by the httpx test above")
+        client = _FakeClient([
+            _FakeStream(fail_with=httpx2.ReadError("connection reset by peer")),
+            _FakeStream(message="recovered"),
+        ])
+        self.assertEqual(note_generator._call_with_retry(client, []), "recovered")
+        self.assertEqual(client.attempts, 2)
+
     def test_persistent_failure_raises_after_max_retries(self):
         client = _FakeClient([
             _FakeStream(fail_with=httpx.ReadError("reset"))

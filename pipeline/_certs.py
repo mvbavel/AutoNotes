@@ -58,11 +58,37 @@ def _pem_blocks(text: str) -> list[str]:
     return blocks
 
 
-def _is_stale(dest: str) -> bool:
-    """True if the combined bundle is missing or older than its sources."""
+def _certifi_stamp(certifi_pem: str | None) -> str:
+    """Identity of the certifi file a bundle was built from ('' if unreadable)."""
+    try:
+        st = os.stat(certifi_pem)
+    except (OSError, TypeError):
+        return ""
+    return f"{st.st_size}:{int(st.st_mtime)}"
+
+
+def _read_stamp(dest: str) -> str:
+    try:
+        with open(dest + ".src", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _is_stale(dest: str, certifi_pem: str | None = None) -> bool:
+    """True if the combined bundle is missing or out of date with its sources.
+
+    certifi counts as a source: a new AutoNotes build ships a newer certifi,
+    and without this the bundle kept the previous build's roots — including any
+    Mozilla has since distrusted — until a keychain happened to change. It is
+    compared by a recorded stamp rather than mtime, because a freshly installed
+    build's certifi file can easily be *older* than the bundle it should replace.
+    """
     try:
         bundle_mtime = os.path.getmtime(dest)
     except OSError:
+        return True
+    if certifi_pem and _read_stamp(dest) != _certifi_stamp(certifi_pem):
         return True
     for kc in _KEYCHAINS:
         try:
@@ -82,7 +108,7 @@ def build_ca_bundle(certifi_pem: str, dest: str | None = None,
     unless it is older than the keychains it was built from.
     """
     dest = dest or bundle_path()
-    if not force and not _is_stale(dest):
+    if not force and not _is_stale(dest, certifi_pem):
         return dest
 
     try:
@@ -107,6 +133,8 @@ def build_ca_bundle(certifi_pem: str, dest: str | None = None,
         with open(tmp, "w", encoding="utf-8") as f:
             f.write("\n".join(blocks) + "\n")
         os.replace(tmp, dest)   # atomic: never leave a half-written bundle
+        with open(dest + ".src", "w", encoding="utf-8") as f:
+            f.write(_certifi_stamp(certifi_pem))
     except OSError:
         return None
     return dest

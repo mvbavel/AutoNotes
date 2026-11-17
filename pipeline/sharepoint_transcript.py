@@ -23,7 +23,7 @@ import json
 import re
 import urllib.parse
 
-from pipeline.vtt_parser import _merge_consecutive, _ts_to_secs
+from pipeline.vtt_parser import merge_consecutive, ts_to_secs
 
 _TIMEOUT = 60
 
@@ -35,7 +35,7 @@ _SP_ITEM_RE = re.compile(
     r"/_api/v[0-9.]+/drives/(?P<drive>[^/]+)/items/(?P<item>[^/?]+)"
 )
 
-_G_FILE_INFO_RE = re.compile(r"g_fileInfo\s*=\s*(\{.*?\});", re.S)
+_G_FILE_INFO_RE = re.compile(r"g_fileInfo\s*=\s*(?=\{)")
 
 # SharePoint serves a different page to non-browser agents
 _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -71,7 +71,7 @@ def _try_browser(url: str, browser: str, log_cb=None) -> list[dict] | None:
     session = requests.Session()
     session.headers["User-Agent"] = _UA
     for cookie in jar:
-        if "sharepoint.com" in (cookie.domain or ""):
+        if _is_sharepoint_domain(cookie.domain):
             session.cookies.set_cookie(cookie)
 
     try:
@@ -79,6 +79,12 @@ def _try_browser(url: str, browser: str, log_cb=None) -> list[dict] | None:
     except Exception as e:
         _log(log_cb, f"Transcript lookup with {browser} cookies failed: {e}")
         return None
+
+
+def _is_sharepoint_domain(domain: str | None) -> bool:
+    """True for sharepoint.com and its subdomains — not 'notsharepoint.com'."""
+    host = (domain or "").lstrip(".").lower()
+    return host == "sharepoint.com" or host.endswith(".sharepoint.com")
 
 
 def _fetch_with_session(session, url: str, log_cb=None) -> list[dict] | None:
@@ -124,6 +130,10 @@ def _fetch_with_session(session, url: str, log_cb=None) -> list[dict] | None:
         return None
 
     download_url = transcript["temporaryDownloadUrl"]
+    # The URL comes from a server response; only ever follow it over HTTPS
+    if urllib.parse.urlparse(download_url).scheme != "https":
+        _log(log_cb, "Transcript download link was not HTTPS — skipping")
+        return None
     download_url += ("&" if "?" in download_url else "?") + "format=json"
     payload = _get_json(session, download_url, {"Accept": "application/json"})
     if payload is None:
@@ -159,9 +169,12 @@ def _extract_g_file_info(html: str) -> dict | None:
     if not match:
         return None
     try:
-        return json.loads(match.group(1))
+        # raw_decode reads exactly one JSON value. A regex up to the first "};"
+        # truncates the blob whenever a file name or title contains "};".
+        info, _ = json.JSONDecoder().raw_decode(html, match.end())
     except (ValueError, TypeError):
         return None
+    return info if isinstance(info, dict) else None
 
 
 def _parse_sp_item_url(sp_item_url: str) -> tuple[str, str, str] | None:
@@ -209,8 +222,8 @@ def _entries_to_segments(entries: list) -> list[dict]:
         if not text:
             continue
         try:
-            start = _ts_to_secs(entry["startOffset"])
-            end = _ts_to_secs(entry["endOffset"])
+            start = ts_to_secs(entry["startOffset"])
+            end = ts_to_secs(entry["endOffset"])
         except (KeyError, ValueError, IndexError, TypeError):
             continue
         segments.append({
@@ -220,7 +233,7 @@ def _entries_to_segments(entries: list) -> list[dict]:
             "text": text,
         })
     segments.sort(key=lambda s: s["start"])
-    return _merge_consecutive(segments)
+    return merge_consecutive(segments)
 
 
 def _log(log_cb, message: str) -> None:

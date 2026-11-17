@@ -1,10 +1,14 @@
+import json
 import math
 import os
-import json
+import re
 import subprocess
+from collections import deque
+
 import numpy as np
 
 from pipeline._paths import FFMPEG, FFPROBE
+from pipeline._util import run_capture, run_streaming
 from pipeline.letterbox import trim_letterbox
 
 MAX_FRAMES = 60                  # hard ceiling on selected frames
@@ -57,7 +61,7 @@ _MAX_AXIS_TILT_DEG = 2.5
 
 def extract_frames(video_path: str, temp_dir: str, progress_cb=None,
                    segments: list[dict] | None = None,
-                   cancel_check=None) -> list[dict]:
+                   cancel_check=None, log_cb=None) -> list[dict]:
     """
     Extract candidate frames from the video, crop to a detected presentation
     screen where possible, collapse near-duplicate slides, score for
@@ -76,18 +80,28 @@ def extract_frames(video_path: str, temp_dir: str, progress_cb=None,
     frames_dir = os.path.join(temp_dir, "frames")
     os.makedirs(frames_dir, exist_ok=True)
 
-    duration = _get_duration(video_path)
+    # Screenshots are optional — an audio-only file is a legitimate input — so
+    # nothing here is fatal, but each empty return says why in the log. A silent
+    # [] used to produce a document with no images and no explanation.
+    duration = _get_duration(video_path, cancel_check)
     if duration <= 0:
+        _log(log_cb, "Couldn't read the recording's length — continuing without screenshots")
         return []
 
-    _extract_all_frames(video_path, frames_dir, duration, progress_cb, cancel_check)
+    error = _extract_all_frames(video_path, frames_dir, duration, progress_cb, cancel_check)
 
     frame_files = sorted(
         f for f in os.listdir(frames_dir)
         if f.startswith("frame_") and f.endswith(".jpg")
     )
     if not frame_files:
+        _log(log_cb, "No video frames could be read"
+                     + (f" ({error})" if error else " (audio-only recording?)")
+                     + " — continuing without screenshots")
         return []
+    if error:
+        _log(log_cb, f"Frame extraction stopped early ({error}) — "
+                     f"using the {len(frame_files)} frames read before that")
 
     cue_windows = _cue_windows(segments)
 
@@ -140,23 +154,39 @@ def extract_frames(video_path: str, temp_dir: str, progress_cb=None,
     return top
 
 
-def _get_duration(video_path: str) -> float:
+def _log(log_cb, message: str) -> None:
+    if log_cb:
+        log_cb(message)
+
+
+def _get_duration(video_path: str, cancel_check=None) -> float:
     cmd = [
         FFPROBE, "-v", "quiet", "-print_format", "json",
         "-show_format", video_path
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = run_capture(cmd, timeout=120, cancel_check=cancel_check)
+    except (OSError, subprocess.TimeoutExpired):
+        return 0.0
     if result.returncode != 0:
         return 0.0
     try:
         return float(json.loads(result.stdout)["format"]["duration"])
-    except (KeyError, ValueError):
+    except (KeyError, ValueError, TypeError):
         return 0.0
 
 
+# ffmpeg's -progress output is key=value lines; anything else is an error message
+_PROGRESS_LINE = re.compile(r"^[a-z_0-9.:]+=")
+
+
 def _extract_all_frames(video_path: str, frames_dir: str, duration: float,
-                        progress_cb=None, cancel_check=None):
-    """Single decode pass sampling one frame every INTERVAL_SECONDS."""
+                        progress_cb=None, cancel_check=None) -> str | None:
+    """Single decode pass sampling one frame every INTERVAL_SECONDS.
+
+    Returns None on success, or ffmpeg's error text when it exited non-zero
+    (the caller decides whether the frames already written are still usable).
+    """
     pattern = os.path.join(frames_dir, "frame_%06d.jpg")
     cmd = [
         FFMPEG, "-y", "-i", video_path,
@@ -166,25 +196,25 @@ def _extract_all_frames(video_path: str, frames_dir: str, duration: float,
         "-progress", "pipe:1", "-nostats", "-loglevel", "error",
         pattern,
     ]
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
-    )
-    try:
-        for line in proc.stdout:
-            if cancel_check:
-                cancel_check()
-            # ffmpeg reports out_time_ms in microseconds
-            if line.startswith("out_time_ms=") and progress_cb:
+    errors = deque(maxlen=5)
+
+    def on_line(line: str) -> None:
+        line = line.strip()
+        # ffmpeg reports out_time_ms in microseconds
+        if line.startswith("out_time_ms="):
+            if progress_cb:
                 try:
                     seconds = int(line.split("=", 1)[1]) / 1_000_000
                 except ValueError:
-                    continue
+                    return
                 progress_cb(min(60, int(seconds / duration * 60)))
-        proc.wait()
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait()
+        elif line and not _PROGRESS_LINE.match(line):
+            errors.append(line)
+
+    returncode = run_streaming(cmd, on_line=on_line, cancel_check=cancel_check)
+    if returncode == 0:
+        return None
+    return "; ".join(errors) or f"ffmpeg exited with code {returncode}"
 
 
 def _frame_index_to_ts(fname: str) -> int:
@@ -259,7 +289,7 @@ def _detect_screen_quad(cv2, img):
         approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
         if len(approx) != 4 or not cv2.isContourConvex(approx):
             continue
-        x, y, w, h = cv2.boundingRect(approx)
+        _, _, w, h = cv2.boundingRect(approx)
         if h == 0 or not (1.0 <= w / h <= 2.6):
             continue
         if area / (w * h) < 0.80:
@@ -284,10 +314,10 @@ def _warp_crop(cv2, img, quad):
     if _max_edge_tilt_deg(ordered) <= _MAX_AXIS_TILT_DEG:
         # Near-axis-aligned: pixel-exact crop, no rotation, no resampling
         h, w = img.shape[:2]
-        x0 = max(0, int(math.floor(min(tl[0], bl[0]))))
-        y0 = max(0, int(math.floor(min(tl[1], tr[1]))))
-        x1 = min(w, int(math.ceil(max(tr[0], br[0]))))
-        y1 = min(h, int(math.ceil(max(br[1], bl[1]))))
+        x0 = max(0, math.floor(min(tl[0], bl[0])))
+        y0 = max(0, math.floor(min(tl[1], tr[1])))
+        x1 = min(w, math.ceil(max(tr[0], br[0])))
+        y1 = min(h, math.ceil(max(br[1], bl[1])))
         if x1 - x0 < 200 or y1 - y0 < 150:
             return None
         return img[y0:y1, x0:x1]

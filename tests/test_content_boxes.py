@@ -1,5 +1,4 @@
 """Tests for per-screenshot content_box validation and cropped DOCX embeds."""
-import io
 import os
 import sys
 import tempfile

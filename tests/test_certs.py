@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -95,6 +96,13 @@ class TestConfigureSslEnv(unittest.TestCase):
         saved = {k: os.environ.get(k) for k in
                  ("SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
                   "CURL_CA_BUNDLE")}
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        # Never touch the real ~/Library/Application Support/AutoNotes bundle
+        bundle = os.path.join(tmp.name, "ca-bundle.pem")
+        patcher = unittest.mock.patch.object(_certs, "bundle_path", return_value=bundle)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         try:
             ca = _certs.configure_ssl_env()
             if ca is None:

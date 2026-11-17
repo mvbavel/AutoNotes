@@ -22,7 +22,7 @@ import unittest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-from pipeline import _certs
+from pipeline import _certs  # noqa: F401  (fails fast here if the module is broken)
 
 
 class TestConfigureTrust(unittest.TestCase):
